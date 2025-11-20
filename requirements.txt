@@ -6,3 +6,4 @@ langchain-openai==0.1.6
 nba_api
 pandas
 duckduckgo-search
+pydantic==1.10.13
