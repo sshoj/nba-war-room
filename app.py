@@ -1,18 +1,3 @@
-import subprocess
-import sys
-
-# --- FORCE INSTALL BLOCK ---
-# This forces the server to install nba_api if it is missing
-def install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-try:
-    import nba_api
-except ImportError:
-    install("nba_api")
-    import nba_api
-# ---------------------------
-
 import streamlit as st
 import pandas as pd
 from nba_api.stats.static import players
@@ -25,99 +10,61 @@ import os
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room", page_icon="🏀")
-
 st.title("🏀 AI NBA War Room")
-st.write("The ultimate pre-game analysis tool for your iPhone.")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
     st.header("⚙️ Settings")
     api_key = st.text_input("Enter OpenAI API Key", type="password")
-    
     if not api_key:
         st.warning("⚠️ Please enter your OpenAI API Key to start.")
         st.stop()
-
     os.environ["OPENAI_API_KEY"] = api_key
 
-# --- DEFINE PYTHON TOOLS ---
-
+# --- TOOLS ---
 def get_last_5_games_stats(player_name):
-    """Fetches last 5 games stats for a player."""
     nba_players = players.get_players()
     player = next((p for p in nba_players if p['full_name'].lower() == player_name.lower()), None)
     if not player: return "Error: Player not found."
-    
-    # Fetch Log (Season 2024-25)
     gamelog = playergamelog.PlayerGameLog(player_id=player['id'], season='2024-25')
     df = gamelog.get_data_frames()[0]
-    
-    if df.empty:
-        return "No games found for this season yet."
-
+    if df.empty: return "No games found."
     cols = ['GAME_DATE', 'MATCHUP', 'WL', 'PTS', 'AST', 'REB', 'STL', 'FG_PCT']
     return df[cols].head(5).to_string(index=False)
 
 def get_team_tactics(team_name):
-    """Fetches team advanced stats (Pace, Ratings)."""
     stats = leaguedashteamstats.LeagueDashTeamStats(measure_type='Advanced', season='2024-25')
     df = stats.get_data_frames()[0]
     team_stats = df[df['TEAM_NAME'].str.contains(team_name, case=False, na=False)]
-    
     if team_stats.empty: return "Error: Team not found."
-    
     cols = ['TEAM_NAME', 'PACE', 'OFF_RATING', 'DEF_RATING', 'AST_TO']
     return team_stats[cols].to_string(index=False)
 
 search = DuckDuckGoSearchRun()
 
-# --- INITIALIZE AGENTS ---
-# Use the API key directly to avoid Pydantic errors
+# --- AGENT ---
 llm = ChatOpenAI(temperature=0, model="gpt-4-turbo", api_key=api_key)
-
 tools = [
     Tool(name="GetLast5Games", func=get_last_5_games_stats, description="Get recent player stats."),
-    Tool(name="GetTeamTactics", func=get_team_tactics, description="Get team advanced stats (Pace, Ratings)."),
+    Tool(name="GetTeamTactics", func=get_team_tactics, description="Get team advanced stats."),
     Tool(name="WebSearch", func=search.run, description="Search for schedule and injuries.")
 ]
+agent = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True, handle_parsing_errors=True)
 
-agent = initialize_agent(
-    tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True, handle_parsing_errors=True
-)
-
-# --- THE APP INTERFACE ---
-
+# --- UI ---
 col1, col2 = st.columns(2)
-with col1:
-    player_name = st.text_input("Player Name", "Luka Doncic")
-with col2:
-    player_team = st.text_input("Player Team", "Dallas Mavericks")
+with col1: p_name = st.text_input("Player Name", "Luka Doncic")
+with col2: p_team = st.text_input("Player Team", "Dallas Mavericks")
 
-if st.button("🚀 RUN WAR ROOM ANALYSIS", type="primary"):
-    with st.spinner("Consulting the Analysts..."):
+if st.button("🚀 RUN WAR ROOM", type="primary"):
+    with st.spinner("Analyzing..."):
         try:
-            # Step 1: Find Opponent
-            st.info(f"🔍 Finding next opponent for {player_team}...")
-            opp_query = f"Who is the {player_team} playing next in the NBA? Return ONLY the team name."
+            opp_query = f"Who is {p_team} playing next? Return ONLY team name."
             opponent = agent.invoke({"input": opp_query})['output']
-            st.success(f"Matchup Identified: vs {opponent}")
+            st.success(f"Matchup: vs {opponent}")
             
-            # Step 2: Run Full Analysis
-            prompt = f"""
-            Perform a full pre-game analysis for {player_name} ({player_team}) vs {opponent}.
-            
-            1. Use 'GetLast5Games' to check {player_name}'s recent form.
-            2. Use 'GetTeamTactics' to check {opponent}'s system (Pace, Def Rating).
-            3. Use 'WebSearch' to check {opponent}'s injury report today.
-            
-            Synthesize this into a final prediction report.
-            """
-            
+            prompt = f"Analyze {p_name} ({p_team}) vs {opponent}. Check last 5 games, team tactics, and injuries. Give a prediction."
             response = agent.invoke({"input": prompt})
-            
-            st.divider()
-            st.markdown("### 📝 Official Scouting Report")
             st.write(response['output'])
-            
         except Exception as e:
-            st.error(f"An error occurred: {e}")
+            st.error(f"Error: {e}")
