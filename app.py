@@ -43,7 +43,7 @@ def get_team_tactics(team_name):
 search = DuckDuckGoSearchRun()
 
 # --- AGENT ---
-llm = ChatOpenAI(temperature=0, model="gpt-4-turbo", api_key=api_key)
+llm = ChatOpenAI(temperature=0, model="gpt-4o", api_key=api_key)
 tools = [
     Tool(name="GetLast5Games", func=get_last_5_games_stats, description="Get recent player stats."),
     Tool(name="GetTeamTactics", func=get_team_tactics, description="Get team advanced stats."),
