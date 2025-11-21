@@ -237,12 +237,22 @@ def get_next_game(team_id):
     except Exception:
         return None, "Error fetching next game.", None, None
 
-def get_betting_odds(player_name, team_name):
+def get_betting_odds(player_name, team_name, bookmakers: str = None):
     """
     Fetches Betting Lines with error handling.
-    STRATEGY:
-    1. Try Player Props (Points, etc.) first.
-    2. If no props found, FALLBACK to Game Moneyline (H2H).
+
+    - Uses /events to find the correct game by team name.
+    - Uses /events/{id}/odds with markets=player_points,player_rebounds,player_assists,h2h.
+    - Player props:
+        - Taken from a single bookmaker (prefer FanDuel, else first).
+    - Moneyline:
+        - Collected from ALL bookmakers in the response (all betting choices).
+
+    :param player_name: "First Last"
+    :param team_name: Full team name from BallDontLie
+    :param bookmakers: Optional comma-separated list of bookmaker keys
+                       (e.g. "fanduel,draftkings,betmgm").
+                       If None, API will return its default set.
     """
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
@@ -264,79 +274,104 @@ def get_betting_odds(player_name, team_name):
             return f"Error fetching games from Odds API (status {games_resp.status_code}): {msg}"
 
         games = games_resp.json()
-
         if not isinstance(games, list) or not games:
             return "No betting lines available."
 
         team_name_lower = team_name.lower()
         game_id = None
-        home_team = None
-        away_team = None
 
         for g in games:
             ht = g.get("home_team", "")
             at = g.get("away_team", "")
             if team_name_lower in ht.lower() or team_name_lower in at.lower():
                 game_id = g.get("id")
-                home_team = ht
-                away_team = at
                 break
         
         if not game_id:
             return f"No active betting lines found for {team_name}."
 
-        # 2. Try Player Props First
-        props_resp = requests.get(
+        # 2. Get props + moneyline in ONE call
+        params = {
+            "apiKey": api_key,
+            "regions": "us",
+            "markets": "player_points,player_rebounds,player_assists,h2h",
+        }
+        if bookmakers:
+            params["bookmakers"] = bookmakers  # e.g. "fanduel,draftkings,betmgm"
+
+        odds_resp = requests.get(
             f"{ODDS_URL}/events/{game_id}/odds",
-            params={
-                "apiKey": api_key,
-                "regions": "us",
-                "markets": "player_points,player_rebounds,player_assists",
-                "bookmakers": "fanduel",
-            },
+            params=params,
             timeout=REQUEST_TIMEOUT,
         )
-        if props_resp.status_code == 200:
-            data = props_resp.json()
-            bookmakers = data.get("bookmakers", [])
-            
-            lines = []
-            if bookmakers:
-                for market in bookmakers[0].get("markets", []):
-                    market_name = market["key"].replace("player_", "").title()
-                    for outcome in market.get("outcomes", []):
-                        p_last = player_name.split()[-1]
-                        if p_last.lower() in outcome.get("description", "").lower():
-                            line = outcome.get("point", "N/A")
-                            price = outcome.get("price", "N/A")
-                            lines.append(f"**{market_name}**: {line} ({price})")
-            
-            if lines:
-                return " | ".join(lines)
-        
-        # 3. Fallback to Moneyline (H2H) if no props found
-        h2h_resp = requests.get(
-            f"{ODDS_URL}/events/{game_id}/odds",
-            params={
-                "apiKey": api_key,
-                "regions": "us",
-                "markets": "h2h",
-                "bookmakers": "fanduel",
-            },
-            timeout=REQUEST_TIMEOUT,
+        if odds_resp.status_code != 200:
+            try:
+                msg = odds_resp.json().get("message", odds_resp.text)
+            except Exception:
+                msg = odds_resp.text
+            return f"Error fetching odds (status {odds_resp.status_code}): {msg}"
+
+        data = odds_resp.json()
+        bookmakers_list = data.get("bookmakers", [])
+        if not bookmakers_list:
+            return "No odds available."
+
+        # --- Player Props from ONE bookmaker (prefer FanDuel, else first) ---
+        props_lines = []
+        props_bookmaker_title = None
+
+        preferred_key = "fanduel"
+        props_bookmaker = next(
+            (b for b in bookmakers_list if b.get("key") == preferred_key),
+            bookmakers_list[0],
         )
-        if h2h_resp.status_code != 200:
-            return "Props not ready. Error fetching moneyline odds."
-        h2h_data = h2h_resp.json()
-        bm_h2h = h2h_data.get("bookmakers", [])
-        
-        if bm_h2h:
-            markets = bm_h2h[0].get("markets", [])
-            if markets:
-                outcomes = markets[0].get("outcomes", [])
-                odds_str = " vs ".join([f"{o['name']} ({o['price']})" for o in outcomes])
-                return f"Props not ready. **Game Odds:** {odds_str}"
-            
+
+        if props_bookmaker:
+            props_bookmaker_title = props_bookmaker.get("title") or props_bookmaker.get("key", "Book")
+            p_last = player_name.split()[-1].lower()
+            for market in props_bookmaker.get("markets", []):
+                mkey = market.get("key", "")
+                if not mkey.startswith("player_"):
+                    continue
+                market_name = mkey.replace("player_", "").title()
+                for outcome in market.get("outcomes", []):
+                    desc = outcome.get("description", "")
+                    if p_last in desc.lower():
+                        line = outcome.get("point", "N/A")
+                        price = outcome.get("price", "N/A")
+                        props_lines.append(f"**{market_name}**: {line} ({price})")
+
+        # --- Moneyline from ALL bookmakers ---
+        moneyline_lines = []
+        for b in bookmakers_list:
+            b_title = b.get("title") or b.get("key", "Book")
+            h2h_market = next(
+                (m for m in b.get("markets", []) if m.get("key") == "h2h"),
+                None,
+            )
+            if not h2h_market:
+                continue
+            outcomes = h2h_market.get("outcomes", [])
+            if len(outcomes) < 2:
+                continue
+            # Build "Book: TeamA (+135) vs TeamB (-150)"
+            parts = [f"{o.get('name', 'Team')} ({o.get('price', 'N/A')})" for o in outcomes]
+            ml_str = " vs ".join(parts)
+            moneyline_lines.append(f"- **{b_title}**: {ml_str}")
+
+        # --- Build final string for display ---
+        sections = []
+
+        if props_lines:
+            label = f"**Player Props ({props_bookmaker_title})**" if props_bookmaker_title else "**Player Props**"
+            sections.append(label + ":\n" + " | ".join(props_lines))
+
+        if moneyline_lines:
+            sections.append("**Game Moneyline (All Books):**\n" + "\n".join(moneyline_lines))
+
+        if sections:
+            return "\n\n".join(sections)
+
         return "No odds available."
 
     except Exception as e:
