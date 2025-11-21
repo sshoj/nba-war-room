@@ -1,161 +1,31 @@
 import streamlit as st
 import requests
-from langchain_openai import ChatOpenAI
-import os
-import pandas as pd
+import json
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="NBA War Room (RapidAPI)", page_icon="🏀")
-st.title("🏀 NBA War Room (RapidAPI Edition)")
-st.markdown("**Source:** RapidAPI (Live Data) | **Coach:** GPT-4o")
+st.title("🔌 'NBA API Free Data' Connection Test")
 
-# --- SIDEBAR: SETTINGS ---
-with st.sidebar:
-    st.header("⚙️ Settings")
-    
-    # 1. RAPID API KEY
-    rapid_key_input = st.text_input("X-RapidAPI-Key", type="password")
-    rapid_host = "free-nba.p.rapidapi.com"
-    st.markdown("[Subscribe to 'Free NBA API'](https://rapidapi.com/theapiguy/api/free-nba)")
-    
-    # 2. OPENAI KEY
-    openai_key_input = st.text_input("OpenAI API Key", type="password")
-    
-    if rapid_key_input: os.environ["RAPID_KEY"] = rapid_key_input.strip()
-    if openai_key_input: os.environ["OPENAI_API_KEY"] = openai_key_input.strip()
+# 1. YOUR SPECIFIC CONFIGURATION
+url = "https://nba-api-free-data.p.rapidapi.com/nba-atlantic-team-list"
+headers = {
+    "x-rapidapi-host": "nba-api-free-data.p.rapidapi.com",
+    # ⚠️ REPLACE THIS WITH YOUR NEW KEY AFTER ROTATING IT
+    "x-rapidapi-key": st.secrets.get("RAPID_KEY", "PASTE_YOUR_KEY_HERE")
+}
 
-# --- RAPID API TOOLS (Now with Timeouts) ---
-def get_player_id(player_name):
-    """Finds the Player ID on RapidAPI with a 10-second timeout."""
-    url = f"https://{rapid_host}/players"
-    querystring = {"search": player_name, "per_page": "100"}
-    headers = {
-        "X-RapidAPI-Key": os.environ.get("RAPID_KEY"),
-        "X-RapidAPI-Host": rapid_host
-    }
-    
+if st.button("Test Connection"):
     try:
-        # TIMEOUT ADDED HERE: Wait max 10 seconds
-        response = requests.get(url, headers=headers, params=querystring, timeout=10)
-        response.raise_for_status() # Check if API returned a 403/500 error
-        data = response.json()
+        st.write(f"Connecting to: `{url}`...")
+        response = requests.get(url, headers=headers)
         
-        for p in data.get('data', []):
-            full_name = f"{p['first_name']} {p['last_name']}"
-            if player_name.lower() in full_name.lower():
-                return p['id'], full_name, p['team']['full_name']
-        return None, None, "Player not found in database."
-        
-    except requests.exceptions.Timeout:
-        return None, None, "Error: Connection Timed Out (10s). API is slow."
-    except requests.exceptions.ConnectionError:
-        return None, None, "Error: No Internet or API Server is Down."
+        if response.status_code == 200:
+            st.success("✅ Connection Successful!")
+            data = response.json()
+            st.write("### Response Data:")
+            st.json(data)
+        elif response.status_code == 403:
+            st.error("❌ 403 Forbidden: You might need to Subscribe to the API plan on RapidAPI.")
+        else:
+            st.error(f"❌ Error {response.status_code}: {response.text}")
+            
     except Exception as e:
-        return None, None, f"Error: {str(e)}"
-
-def get_last_5_games(player_id):
-    """Fetches stats with a timeout."""
-    url = f"https://{rapid_host}/stats"
-    querystring = {
-        "seasons[]": "2024", 
-        "player_ids[]": str(player_id),
-        "per_page": "5"
-    }
-    headers = {
-        "X-RapidAPI-Key": os.environ.get("RAPID_KEY"),
-        "X-RapidAPI-Host": rapid_host
-    }
-    
-    try:
-        # TIMEOUT ADDED HERE
-        response = requests.get(url, headers=headers, params=querystring, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        games = []
-        for g in data.get('data', []):
-            game_info = g['game']
-            matchup = f"{game_info['visitor_team']['abbreviation']} @ {game_info['home_team']['abbreviation']}"
-            stats = f"PTS: {g['pts']} | REB: {g['reb']} | AST: {g['ast']}"
-            date = game_info['date'].split("T")[0]
-            games.append(f"Date: {date} | {matchup} | {stats}")
-            
-        return "\n".join(games) if games else "No games found for 2024-25 season."
-        
-    except requests.exceptions.Timeout:
-        return "Error: Connection Timed Out (10s)."
-    except Exception as e:
-        return f"Error fetching stats: {str(e)}"
-
-# --- MAIN APP ---
-if rapid_key_input and openai_key_input:
-    
-    # Initialize ChatOpenAI (Safe Mode)
-    llm_coach = ChatOpenAI(
-        model="gpt-4o", 
-        temperature=0.5, 
-        api_key=openai_key_input
-    )
-
-    # --- UI ---
-    col1, col2 = st.columns(2)
-    with col1: p_name = st.text_input("Player Name", "Luka Doncic")
-    with col2: p_team = st.text_input("Player Team", "Dallas Mavericks")
-
-    if st.button("🚀 RUN RAPID ANALYSIS", type="primary"):
-        
-        stats_report = ""
-        
-        # --- PHASE 1: FETCH DATA ---
-        with st.spinner(f"Ping {rapid_host} (Max 10s)..."):
-            
-            # 1. Get ID (With error check)
-            pid, full_name, team = get_player_id(p_name)
-            
-            # STOPPAGE IF ERROR
-            if not pid:
-                # If 'team' variable contains an error message, show it
-                error_msg = team if team else "Unknown Error"
-                st.error(f"Failed to find player. {error_msg}")
-                st.stop() # <--- STOPS THE APP HERE
-            
-            st.success(f"Found: {full_name} ({team}) - ID: {pid}")
-            
-            # 2. Get Stats (With error check)
-            stats_report = get_last_5_games(pid)
-            
-            # STOPPAGE IF ERROR
-            if "Error" in stats_report:
-                st.error(stats_report)
-                st.stop() # <--- STOPS THE APP HERE
-                
-            with st.expander("📊 Read Live Stats (Raw JSON)", expanded=True):
-                st.code(stats_report)
-
-        # --- PHASE 2: COACHING ---
-        if stats_report:
-            with st.spinner("GPT-4o is analyzing the trends..."):
-                try:
-                    coach_prompt = f"""
-                    You are an NBA Head Coach.
-                    
-                    PLAYER: {full_name} ({team})
-                    RECENT FORM (Last 5 Games):
-                    {stats_report}
-                    
-                    TASK:
-                    1. Analyze his trend (Hot/Cold?).
-                    2. Predict his stat line for the next game.
-                    3. Give a betting recommendation (Over/Under on points).
-                    """
-                    final_prediction = llm_coach.invoke(coach_prompt).content
-                    
-                    st.divider()
-                    st.markdown("### 🏆 Official Prediction")
-                    st.write(final_prediction)
-                    
-                except Exception as e:
-                    st.error(f"Coaching Failed: {e}")
-
-elif not rapid_key_input or not openai_key_input:
-    st.warning("⚠️ Please enter both API Keys to start.")
+        st.error(f"System Error: {e}")
