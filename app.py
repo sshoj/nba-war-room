@@ -83,7 +83,12 @@ def get_last_5_games(player_id):
 # --- MAIN APP ---
 if rapid_key_input and openai_key_input:
     
-    llm_coach = ChatOpenAI(model="gpt-4o", temperature=0.5)
+    # FIX: Pass api_key explicitly to avoid Pydantic Validation Error
+    llm_coach = ChatOpenAI(
+        model="gpt-4o", 
+        temperature=0.5, 
+        api_key=openai_key_input
+    )
 
     # --- UI ---
     col1, col2 = st.columns(2)
