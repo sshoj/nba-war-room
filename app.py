@@ -460,6 +460,7 @@ def get_team_rotation(team_id, n_games: int = 7):
     - Uses last n games' stats.
     - Aggregates minutes per player.
     - Labels top 5 by avg minutes as 'Starter', rest as 'Bench/Rotation'.
+    - Uses both roster and stats to resolve actual player names/positions.
     """
     past_games = get_team_schedule_before_today(team_id, n_games=n_games)
     if not past_games:
@@ -486,14 +487,26 @@ def get_team_rotation(team_id, n_games: int = 7):
 
     # Aggregate minutes for this team only
     per_player = {}
+    # Also capture names/positions directly from stats (for players not on current roster)
+    stats_players = {}
+
     for s in stats:
         team = s.get("team") or {}
         if team.get("id") != team_id:
             continue
+
         player = s.get("player") or {}
         pid = player.get("id")
         if not pid:
             continue
+
+        # Save player info from stats
+        if pid not in stats_players:
+            stats_players[pid] = {
+                "name": f"{player.get('first_name','')} {player.get('last_name','')}".strip(),
+                "position": player.get("position", ""),
+            }
+
         min_val = parse_minutes(s.get("min"))
         if pid not in per_player:
             per_player[pid] = {"total_min": 0.0, "games_played": 0}
@@ -504,17 +517,32 @@ def get_team_rotation(team_id, n_games: int = 7):
     if not per_player:
         return []
 
+    # Roster also helps for current team position info
     roster = get_team_players(team_id)
     rows = []
     for pid, agg in per_player.items():
         gp = agg["games_played"] or 1
         avg_min = agg["total_min"] / gp
-        info = roster.get(pid, {})
+
+        info_roster = roster.get(pid, {})
+        info_stats = stats_players.get(pid, {})
+
+        name = (
+            info_roster.get("name")
+            or info_stats.get("name")
+            or f"Player {pid}"
+        )
+        position = (
+            info_roster.get("position")
+            or info_stats.get("position")
+            or ""
+        )
+
         rows.append(
             {
                 "Player ID": pid,
-                "Name": info.get("name", f"Player {pid}"),
-                "Pos": info.get("position", ""),
+                "Name": name,
+                "Pos": position,
                 "Avg MIN": round(avg_min, 1),
                 "Games Played": agg["games_played"],
             }
@@ -627,7 +655,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                         "Date": d,
                         "Location": loc,
                         "Opponent": opp_abbr,
-                        "MIN": min_val if played else 0,
+                        "MIN": parse_minutes(min_val) if played else 0,
                         "PTS": stat.get("pts", 0) if stat else 0,
                         "REB": stat.get("reb", 0) if stat else 0,
                         "AST": stat.get("ast", 0) if stat else 0,
@@ -779,17 +807,37 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                 df_rot = df_rot.drop(columns=["Player ID"])
             st.dataframe(df_rot, use_container_width=True)
 
-        # Player recent stats table + chart
+        # Player recent stats table + chart + KPI metrics
         stats_rows = data.get("stats_rows")
         if stats_rows:
-            st.subheader("📜 Player Game Log (Last 7)")
             df_stats = pd.DataFrame(stats_rows)
+
+            # Player KPI metrics (averages over last games played)
+            try:
+                df_played = df_stats[~df_stats["Is_DNP"]].copy()
+                if not df_played.empty:
+                    avg_min = df_played["MIN"].mean()
+                    avg_pts = df_played["PTS"].mean()
+                    avg_reb = df_played["REB"].mean()
+                    avg_ast = df_played["AST"].mean()
+
+                    st.subheader(f"🎯 {p_label} – Key Averages (Last 7 Games)")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("MIN", f"{avg_min:.1f}")
+                    c2.metric("PTS", f"{avg_pts:.1f}")
+                    c3.metric("REB", f"{avg_reb:.1f}")
+                    c4.metric("AST", f"{avg_ast:.1f}")
+            except Exception:
+                pass
+
+            # Game Log table with player name in title
+            st.subheader(f"📜 {p_label} – Game Log (Last 7)")
             st.dataframe(df_stats, use_container_width=True)
 
             # Last game where player actually played (non-DNP)
             last_played = next((row for row in stats_rows if not row["Is_DNP"]), None)
             if last_played:
-                st.subheader("🎯 Last Game Played (Most Recent Non-DNP)")
+                st.subheader("🕒 Last Game Played (Most Recent Non-DNP)")
                 st.table(
                     pd.DataFrame(
                         [
@@ -825,9 +873,16 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             st.dataframe(df_opp, use_container_width=True)
         
         with st.expander("View Raw Logs & Injuries", expanded=False):
+            # Context header
+            st.markdown(f"**Player:** {p_label}")
+            st.markdown(f"**Matchup:** {m_label}")
+            st.markdown(f"**Date:** {d_label}")
+
             c1, c2 = st.columns(2)
             c1.warning(f"Home Injuries:\n{data.get('inj_home', 'N/A')}")
             c2.error(f"Away Injuries:\n{data.get('inj_opp', 'N/A')}")
+
+            st.markdown("**Raw Game Log (Last 7):**")
             st.code(data.get("log", "No logs"))
             
         st.write("### 🧠 Betting Advice")
