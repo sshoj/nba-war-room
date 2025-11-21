@@ -1,67 +1,88 @@
 import streamlit as st
-from langchain_google_genai import ChatGoogleGenerativeAI
+import requests
 from langchain_openai import ChatOpenAI
-from ddgs import DDGS
 import os
-import time
-import random
+import pandas as pd
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="NBA War Room (Unblockable)", page_icon="🏀")
-st.title("🏀 NBA War Room (Unblockable)")
-st.markdown("**Mode:** Anti-Blocking | **Scout:** Gemini 2.5 | **Coach:** GPT-4o")
+st.set_page_config(page_title="NBA War Room (RapidAPI)", page_icon="🏀")
+st.title("🏀 NBA War Room (RapidAPI Edition)")
+st.markdown("**Source:** RapidAPI (Live Data) | **Coach:** GPT-4o")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    google_key_input = st.text_input("Google Gemini Key", type="password")
-    if google_key_input: os.environ["GOOGLE_API_KEY"] = google_key_input.strip()
+    # 1. RAPID API KEY
+    rapid_key_input = st.text_input("X-RapidAPI-Key", type="password")
+    # Note: We use the 'free-nba' host because it has the best stat endpoints
+    rapid_host = "free-nba.p.rapidapi.com"
+    st.markdown("[Subscribe to 'Free NBA API'](https://rapidapi.com/theapiguy/api/free-nba)")
     
+    # 2. OPENAI KEY
     openai_key_input = st.text_input("OpenAI API Key", type="password")
-    if openai_key_input: os.environ["OPENAI_API_KEY"] = openai_key_input.strip()
     
-    st.divider()
-    manual_opponent = st.text_input("Manual Opponent (Optional)", placeholder="e.g. Celtics")
+    if rapid_key_input: os.environ["RAPID_KEY"] = rapid_key_input.strip()
+    if openai_key_input: os.environ["OPENAI_API_KEY"] = openai_key_input.strip()
 
-# --- ROBUST SEARCH TOOL (Bypasses 202 Ratelimit) ---
-def safe_search(query):
-    """
-    Uses the 'html' backend to bypass API rate limits.
-    Retries with exponential backoff if blocked.
-    """
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # Sleep random amount to look human (2-4 seconds)
-            time.sleep(random.uniform(2, 4))
+# --- RAPID API TOOLS ---
+def get_player_id(player_name):
+    """Finds the Player ID on RapidAPI"""
+    url = f"https://{rapid_host}/players"
+    querystring = {"search": player_name, "per_page": "100"}
+    headers = {
+        "X-RapidAPI-Key": os.environ.get("RAPID_KEY"),
+        "X-RapidAPI-Host": rapid_host
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, params=querystring)
+        data = response.json()
+        
+        # Filter for exact match or close match
+        for p in data.get('data', []):
+            # Simple check if the search term is in the full name
+            full_name = f"{p['first_name']} {p['last_name']}"
+            if player_name.lower() in full_name.lower():
+                return p['id'], full_name, p['team']['full_name']
+        return None, None, None
+    except Exception as e:
+        return None, None, str(e)
+
+def get_last_5_games(player_id):
+    """Fetches the last 5 games stats for the player"""
+    url = f"https://{rapid_host}/stats"
+    # We ask for the 2024 season (which covers 2024-2025)
+    querystring = {
+        "seasons[]": "2024", 
+        "player_ids[]": str(player_id),
+        "per_page": "5"  # Get last 5
+    }
+    headers = {
+        "X-RapidAPI-Key": os.environ.get("RAPID_KEY"),
+        "X-RapidAPI-Host": rapid_host
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, params=querystring)
+        data = response.json()
+        
+        games = []
+        for g in data.get('data', []):
+            game_info = g['game']
+            matchup = f"{game_info['visitor_team']['abbreviation']} @ {game_info['home_team']['abbreviation']}"
+            stats = f"PTS: {g['pts']} | REB: {g['reb']} | AST: {g['ast']}"
+            date = game_info['date'].split("T")[0]
+            games.append(f"Date: {date} | {matchup} | {stats}")
             
-            # Use 'html' backend which is slower but rarely blocked
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, backend="html", max_results=1))
-                
-            if results:
-                return results[0]['body']
-            else:
-                return "No results found."
-                
-        except Exception as e:
-            if "Ratelimit" in str(e) and attempt < max_retries - 1:
-                st.toast(f"Rate limited... retrying in 5s (Attempt {attempt+1})")
-                time.sleep(5) # Wait longer before retry
-                continue
-            return f"Search Error: {e}"
+        # Join them into a string
+        return "\n".join(games) if games else "No games found for 2024-25 season."
+    except Exception as e:
+        return f"Error fetching stats: {e}"
 
 # --- MAIN APP ---
-if google_key_input and openai_key_input:
+if rapid_key_input and openai_key_input:
     
-    # Initialize Models
-    # We use transport="rest" to avoid Streamlit crashes
-    llm_scout = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash", 
-        temperature=0, 
-        transport="rest"
-    )
     llm_coach = ChatOpenAI(model="gpt-4o", temperature=0.5)
 
     # --- UI ---
@@ -69,75 +90,47 @@ if google_key_input and openai_key_input:
     with col1: p_name = st.text_input("Player Name", "Luka Doncic")
     with col2: p_team = st.text_input("Player Team", "Dallas Mavericks")
 
-    if st.button("🚀 RUN ROBUST ANALYSIS", type="primary"):
+    if st.button("🚀 RUN RAPID ANALYSIS", type="primary"):
         
-        scouting_report = ""
+        stats_report = ""
         
-        # --- PHASE 1: PYTHON GATHERS DATA (Stealth Mode) ---
-        with st.spinner("Step 1: Python is searching (Stealth Mode)..."):
+        # --- PHASE 1: FETCH DATA (Direct API) ---
+        with st.spinner(f"Ping {rapid_host} for stats..."):
             
-            # 1. Determine Opponent
-            if manual_opponent:
-                opponent = manual_opponent
-                st.success(f"Targeting Matchup: {p_team} vs {opponent}")
-            else:
-                # Search for schedule
-                schedule_query = f"Who are the {p_team} playing next in November 2025? Return team name."
-                opponent_raw = safe_search(schedule_query)
-                opponent = opponent_raw[:50] # Keep it short
-                st.info(f"Found Matchup Data: {opponent}")
+            # 1. Get ID
+            pid, full_name, team = get_player_id(p_name)
             
-            # 2. Run Key Searches (One by one to be safe)
-            
-            # Player Stats
-            st.write(f"🔎 Searching for {p_name}'s recent stats...")
-            raw_p_stats = safe_search(f"{p_name} last 5 games stats box score November 2025")
-            
-            # Team Tactics
-            st.write(f"🔎 Searching for {opponent} defensive ratings...")
-            raw_t_stats = safe_search(f"{opponent} NBA defensive rating pace stats 2025")
-            
-            # Injuries
-            st.write(f"🔎 Searching for {opponent} injury report...")
-            raw_injuries = safe_search(f"{opponent} NBA injury report today November 2025")
-
-        # --- PHASE 2: GEMINI SUMMARIZES ---
-        with st.spinner("Step 2: Gemini is analyzing the data..."):
-            try:
-                scout_prompt = f"""
-                You are an NBA Scout. I have gathered raw search data for you.
-                Target: {p_name} vs {opponent}.
-                
-                RAW DATA:
-                1. PLAYER STATS: {raw_p_stats}
-                2. OPPONENT STATS: {raw_t_stats}
-                3. INJURIES: {raw_injuries}
-                
-                TASK:
-                Write a concise "Scouting Report".
-                - If the data says "Rate limit", admit you couldn't find it.
-                - Otherwise, summarize the Points/Rebounds/Assists and Team Defense.
-                """
-                
-                scouting_report = llm_scout.invoke(scout_prompt).content
-                
-                with st.expander("📄 Read Scout's Report", expanded=True):
-                    st.write(scouting_report)
-
-            except Exception as e:
-                st.error(f"Gemini Error: {e}")
+            if not pid:
+                st.error(f"Player '{p_name}' not found on RapidAPI.")
                 st.stop()
+            
+            st.success(f"Found: {full_name} ({team}) - ID: {pid}")
+            
+            # 2. Get Stats
+            stats_report = get_last_5_games(pid)
+            
+            if "Error" in stats_report:
+                st.error(stats_report)
+                st.stop()
+                
+            with st.expander("📊 Read Live Stats (Raw JSON)", expanded=True):
+                st.code(stats_report)
 
-        # --- PHASE 3: GPT-4o PREDICTS ---
-        if scouting_report:
-            with st.spinner("Step 3: GPT-4o is predicting the game..."):
+        # --- PHASE 2: GPT-4o COACHING ---
+        if stats_report:
+            with st.spinner("GPT-4o is analyzing the trends..."):
                 try:
                     coach_prompt = f"""
-                    You are an NBA Head Coach. 
-                    Based on this scouting report, predict the winner and score.
+                    You are an NBA Head Coach.
                     
-                    REPORT:
-                    {scouting_report}
+                    PLAYER: {full_name} ({team})
+                    RECENT FORM (Last 5 Games):
+                    {stats_report}
+                    
+                    TASK:
+                    1. Analyze his trend (Hot/Cold?).
+                    2. Predict his stat line for the next game.
+                    3. Give a betting recommendation (Over/Under on points).
                     """
                     final_prediction = llm_coach.invoke(coach_prompt).content
                     
@@ -148,5 +141,5 @@ if google_key_input and openai_key_input:
                 except Exception as e:
                     st.error(f"Coaching Failed: {e}")
 
-elif not google_key_input or not openai_key_input:
+elif not rapid_key_input or not openai_key_input:
     st.warning("⚠️ Please enter both API Keys to start.")
