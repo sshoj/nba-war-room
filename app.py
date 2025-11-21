@@ -25,7 +25,8 @@ try:
     )
     
     # 4. Get the DataFrame
-    # The endpoint returns a list of DataFrames. We want the first one (Index 0).
+    # The standard method is .get_data_frames(), which returns a list. 
+    # Index [0] is the main team info.
     df = mavs_info.get_data_frames()[0]
     
     # 5. Display Result
