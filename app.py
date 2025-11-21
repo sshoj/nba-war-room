@@ -3,12 +3,12 @@ import requests
 from langchain_openai import ChatOpenAI
 import os
 from datetime import datetime, timedelta
-import pytz
+import time
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room (Pro)", page_icon="🏀", layout="wide")
 st.title("🏀 NBA War Room (Pro Edition)")
-st.markdown("**Data:** BallDontLie (Live) | **Logic:** Date-Aware | **Coach:** GPT-4o")
+st.markdown("**Data:** BallDontLie (Live) | **Logic:** Smart Schedule | **Coach:** GPT-4o")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
@@ -33,6 +33,9 @@ def get_player_data(player_name):
         url = f"{BASE_URL}/players"
         params = {"search": player_name}
         resp = requests.get(url, headers=get_headers(), params=params)
+        
+        if resp.status_code != 200: return None, None, None
+        
         data = resp.json()['data']
         return (data[0]['id'], data[0]['first_name'] + " " + data[0]['last_name'], data[0]['team']) if data else (None, None, None)
     except: return None, None, None
@@ -41,30 +44,41 @@ def get_advanced_stats(player_id):
     """Fetches detailed stats: PTS, REB, AST, STL, BLK, TO, FG%"""
     try:
         url = f"{BASE_URL}/stats"
-        # Get last 10 games for better sample size
-        params = {"seasons[]": 2024, "player_ids[]": player_id, "per_page": 10} 
+        # Get last 10 games to ensure we have enough data
+        # Season 2025 = 2025-2026 Season
+        params = {"seasons[]": 2025, "player_ids[]": player_id, "per_page": 10} 
         resp = requests.get(url, headers=get_headers(), params=params)
+        
+        if resp.status_code != 200:
+            return f"API Error: {resp.status_code}"
+            
         data = resp.json()['data']
         
-        if not data: return "No games found."
+        if not data: return "No games found for 2025 season."
         
         games_log = []
         for g in data:
             # Parse "Deep Stats"
             date = g['game']['date'].split("T")[0]
-            opp = g['game']['visitor_team']['abbreviation'] if g['game']['home_team']['id'] == g['team']['id'] else g['game']['home_team']['abbreviation']
             
-            # Handle shooting percentages safely
+            # Handle shooting percentages safely (avoid NoneTypes)
             fg_pct = f"{g['fg_pct'] * 100:.1f}%" if g['fg_pct'] else "0%"
             fg3_pct = f"{g['fg3_pct'] * 100:.1f}%" if g['fg3_pct'] else "0%"
+            
+            # Determine opponent
+            is_home = g['game']['home_team']['id'] == g['team']['id']
+            opp_abbr = g['game']['visitor_team']['abbreviation'] if is_home else g['game']['home_team']['abbreviation']
+            location = "vs" if is_home else "@"
             
             # The "Deep" Stat Line
             stat_line = (f"PTS:{g['pts']} REB:{g['reb']} AST:{g['ast']} "
                          f"STL:{g['stl']} BLK:{g['blk']} TO:{g['turnover']} "
                          f"FG:{fg_pct} 3PT:{fg3_pct}")
             
-            games_log.append(f"[{date} vs {opp}] {stat_line}")
+            games_log.append(f"[{date} {location} {opp_abbr}] {stat_line}")
             
+        # Sort by date descending (newest first) just in case API didn't
+        games_log.sort(reverse=True)
         return "\n".join(games_log[:5]) # Return top 5 most recent
     except Exception as e: return f"Error: {e}"
 
@@ -86,36 +100,42 @@ def find_exact_next_game(team_id):
             "team_ids[]": team_id,
             "start_date": today,
             "end_date": next_week,
-            "per_page": 5
+            "per_page": 10
         }
         
         resp = requests.get(url, headers=get_headers(), params=params)
+        
+        if resp.status_code != 200: return None, "API Error looking up schedule."
+        
         games = resp.json()['data']
         
         if not games: return None, "No games scheduled for the next 7 days."
         
-        # Sort by Date/Time to be sure
+        # Sort by Date to find the soonest one
         games.sort(key=lambda x: x['date'])
         
         # Logic: Find first game that is NOT "Final"
         for game in games:
-            status = game['status'].strip() # e.g. "Final", "8:00 PM ET", "1st Qtr"
+            status = game['status'].strip() # e.g. "Final", "8:00 PM ET", "2025-11-21T..."
             
-            # If game is finished, skip it (it's in the past)
+            # If game is finished, skip it
             if status == "Final":
                 continue
                 
             # We found the next active game!
             home = game['home_team']['full_name']
             visitor = game['visitor_team']['full_name']
-            date_str = game['date'].split("T")[0]
+            
+            # Parse the time nicely
+            # The API usually returns "2025-11-21T00:00:00.000Z" or a time string
+            time_display = game['status'] if ":" in game['status'] else game['date'].split("T")[0]
             
             if game['home_team']['id'] == team_id:
-                return f"vs {visitor}", f"{date_str} @ {status}"
+                return f"vs {visitor}", time_display
             else:
-                return f"@ {home}", f"{date_str} @ {status}"
+                return f"@ {home}", time_display
                 
-        return None, "No upcoming games found (Season might be over/paused)."
+        return None, "No upcoming games found (Season might be paused)."
         
     except Exception as e: return None, f"Error: {e}"
 
@@ -131,31 +151,42 @@ if bdl_key and openai_key:
         
         with st.spinner("🔍 Scouting Player & Schedule..."):
             # 1. Find Player
-            pid, full_name, team_data = get_player_data(p_name)
-            if not pid:
+            # Add small delay to avoid rate limit
+            time.sleep(0.2)
+            player_res = get_player_data(p_name)
+            
+            if not player_res[0]:
                 st.error("Player not found!")
                 st.stop()
             
+            pid, full_name, team_data = player_res
             team_name = team_data['full_name']
             st.success(f"Found: {full_name} ({team_name})")
             
             # 2. Smart Schedule Search
+            time.sleep(0.2)
             opponent, game_time = find_exact_next_game(team_data['id'])
             
             if not opponent:
-                st.warning(f"Schedule Alert: {game_time}") # prints error msg
-                st.stop()
-                
-            st.info(f"📅 NEXT GAME: {opponent} | ⏰ {game_time}")
+                st.warning(f"Schedule Alert: {game_time}")
+                # We can still analyze player form even if no next game found
+                opponent = "Unknown Opponent"
+                game_time = "TBD"
+            else:
+                st.info(f"📅 NEXT GAME: {opponent} | ⏰ {game_time}")
             
             # 3. Get Deep Stats
+            time.sleep(0.2)
             stats_report = get_advanced_stats(pid)
             
             with st.expander("📊 Read Deep Stats (Steals/Blocks/FG%)", expanded=True):
-                st.text(stats_report)
+                if "Error" in stats_report:
+                    st.error(stats_report)
+                else:
+                    st.text(stats_report)
                 
         # 4. AI Analysis
-        if stats_report:
+        if stats_report and "Error" not in stats_report:
             with st.spinner("🧠 GPT-4o is calculating win probability..."):
                 try:
                     prompt = f"""
@@ -164,12 +195,12 @@ if bdl_key and openai_key:
                     TARGET PLAYER: {full_name} ({team_name})
                     NEXT MATCHUP: {opponent} (Time: {game_time})
                     
-                    DEEP STATS (Last 5 Games):
+                    DEEP STATS (Last 5 Games - 2025 Season):
                     {stats_report}
                     
                     YOUR MISSION:
                     1. **Form Check:** Look at his FG% and Turnovers. Is he efficient or sloppy right now?
-                    2. **Defensive Impact:** Is he getting Steals/Blocks?
+                    2. **Defensive Impact:** Is he getting Stocks (Steals + Blocks)?
                     3. **Prediction:** Project his stat line (PTS/REB/AST) for the upcoming game.
                     4. **Verdict:** Give a specific "Player Prop" recommendation (e.g., "Over 28.5 Points").
                     """
