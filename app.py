@@ -12,17 +12,18 @@ import os
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room (Hybrid)", page_icon="🏀")
 st.title("🏀 Hybrid AI War Room")
-st.markdown("**Scout:** Gemini 1.5 Flash (Free/Fast) | **Coach:** GPT-4o (Paid)")
+st.markdown("**Scout:** Gemini 2.5 Flash (Free) | **Coach:** GPT-4o (Paid)")
 
 # --- SIDEBAR: DUAL KEYS ---
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    # We add .strip() here to remove accidental spaces
+    # 1. Google Key (Scout) - Added .strip() to fix "Invalid Key" errors
     google_key_input = st.text_input("Google Gemini Key", type="password")
     google_key = google_key_input.strip() if google_key_input else None
     st.markdown("[Get Free Google Key](https://aistudio.google.com/app/apikey)")
     
+    # 2. OpenAI Key (Coach)
     openai_key_input = st.text_input("OpenAI API Key", type="password")
     openai_key = openai_key_input.strip() if openai_key_input else None
     st.markdown("[Get OpenAI Key](https://platform.openai.com/account/api-keys)")
@@ -58,11 +59,10 @@ search = DuckDuckGoSearchRun()
 
 # --- MAIN APP LOGIC ---
 if google_key and openai_key:
-    # 1. THE SCOUT (Gemini 1.5 Flash)
-    # We use 'gemini-1.5-flash' which is the most stable free model right now.
-    # We use transport="rest" to stop the Streamlit crash.
+    # 1. THE SCOUT (Gemini 2.5 Flash)
+    # UPDATED: Switched to 'gemini-2.5-flash' (The new stable free model)
     llm_scout = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash", 
+        model="gemini-2.5-flash", 
         temperature=0, 
         google_api_key=google_key,
         transport="rest"
@@ -93,7 +93,7 @@ if google_key and openai_key:
     if st.button("🚀 RUN HYBRID ANALYSIS", type="primary"):
         
         scouting_report = ""
-        with st.spinner("Step 1: Gemini (Scout) is gathering data..."):
+        with st.spinner("Step 1: Gemini 2.5 (Scout) is gathering data..."):
             try:
                 opp_query = f"Who is {p_team} playing next? Return ONLY team name."
                 opponent = scout_agent.invoke({"input": opp_query})['output']
