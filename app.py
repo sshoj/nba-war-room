@@ -1,7 +1,7 @@
 import streamlit as st
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 import os
 import time
 import random
