@@ -2,22 +2,20 @@ import streamlit as st
 import requests
 from langchain_openai import ChatOpenAI
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
+import pytz
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="NBA War Room (BallDontLie)", page_icon="🏀")
-st.title("🏀 NBA War Room (BallDontLie Edition)")
-st.markdown("**Data Source:** BallDontLie API (Official) | **Coach:** GPT-4o")
+st.set_page_config(page_title="NBA War Room (Pro)", page_icon="🏀", layout="wide")
+st.title("🏀 NBA War Room (Pro Edition)")
+st.markdown("**Data:** BallDontLie (Live) | **Logic:** Date-Aware | **Coach:** GPT-4o")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
     st.header("⚙️ Settings")
-    
-    # 1. BALLDONTLIE KEY
     bdl_key = st.text_input("BallDontLie API Key", type="password")
     st.markdown("[Get Free Key](https://balldontlie.io/)")
     
-    # 2. OPENAI KEY
     openai_key = st.text_input("OpenAI API Key", type="password")
     
     if bdl_key: os.environ["BDL_API_KEY"] = bdl_key.strip()
@@ -36,74 +34,92 @@ def get_player_data(player_name):
         params = {"search": player_name}
         resp = requests.get(url, headers=get_headers(), params=params)
         data = resp.json()['data']
-        
-        if not data:
-            return None, None, None
-            
-        # Return first match
-        p = data[0]
-        return p['id'], p['first_name'] + " " + p['last_name'], p['team']
-    except Exception as e:
-        return None, None, str(e)
+        return (data[0]['id'], data[0]['first_name'] + " " + data[0]['last_name'], data[0]['team']) if data else (None, None, None)
+    except: return None, None, None
 
-def get_last_5_games(player_id):
-    """Fetches last 5 games stats"""
+def get_advanced_stats(player_id):
+    """Fetches detailed stats: PTS, REB, AST, STL, BLK, TO, FG%"""
     try:
         url = f"{BASE_URL}/stats"
-        # Season 2024 = 2024-2025 Season
-        params = {
-            "seasons[]": 2024,
-            "player_ids[]": player_id,
-            "per_page": 5
-        }
+        # Get last 10 games for better sample size
+        params = {"seasons[]": 2024, "player_ids[]": player_id, "per_page": 10} 
         resp = requests.get(url, headers=get_headers(), params=params)
         data = resp.json()['data']
         
-        if not data:
-            return "No games found for 2024-25 season."
-            
-        # Format data for GPT
+        if not data: return "No games found."
+        
         games_log = []
         for g in data:
-            matchup = f"{g['game']['visitor_team']['abbreviation']} @ {g['game']['home_team']['abbreviation']}"
+            # Parse "Deep Stats"
             date = g['game']['date'].split("T")[0]
-            stat_line = f"PTS: {g['pts']}, REB: {g['reb']}, AST: {g['ast']}"
-            games_log.append(f"{date} | {matchup} | {stat_line}")
+            opp = g['game']['visitor_team']['abbreviation'] if g['game']['home_team']['id'] == g['team']['id'] else g['game']['home_team']['abbreviation']
             
-        return "\n".join(games_log)
-    except Exception as e:
-        return f"Error: {e}"
+            # Handle shooting percentages safely
+            fg_pct = f"{g['fg_pct'] * 100:.1f}%" if g['fg_pct'] else "0%"
+            fg3_pct = f"{g['fg3_pct'] * 100:.1f}%" if g['fg3_pct'] else "0%"
+            
+            # The "Deep" Stat Line
+            stat_line = (f"PTS:{g['pts']} REB:{g['reb']} AST:{g['ast']} "
+                         f"STL:{g['stl']} BLK:{g['blk']} TO:{g['turnover']} "
+                         f"FG:{fg_pct} 3PT:{fg3_pct}")
+            
+            games_log.append(f"[{date} vs {opp}] {stat_line}")
+            
+        return "\n".join(games_log[:5]) # Return top 5 most recent
+    except Exception as e: return f"Error: {e}"
 
-def get_next_game(team_id):
-    """Finds the next scheduled game for the team"""
+def find_exact_next_game(team_id):
+    """
+    Smart Scheduler:
+    1. Looks at the next 7 days.
+    2. Filters out games that are already 'Final'.
+    3. Returns the true next matchup with date/time.
+    """
     try:
         url = f"{BASE_URL}/games"
+        
+        # Date Logic: Range from Today to Today+7 Days
         today = datetime.now().strftime("%Y-%m-%d")
+        next_week = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        
         params = {
             "team_ids[]": team_id,
             "start_date": today,
-            "per_page": 1  # Get next 1 game
+            "end_date": next_week,
+            "per_page": 5
         }
+        
         resp = requests.get(url, headers=get_headers(), params=params)
-        data = resp.json()['data']
+        games = resp.json()['data']
         
-        if not data:
-            return "Unknown Opponent (Schedule not found)"
-            
-        game = data[0]
-        home_team = game['home_team']['full_name']
-        visitor_team = game['visitor_team']['full_name']
+        if not games: return None, "No games scheduled for the next 7 days."
         
-        # Determine opponent
-        if game['home_team']['id'] == team_id:
-            return f"vs {visitor_team}"
-        else:
-            return f"@ {home_team}"
+        # Sort by Date/Time to be sure
+        games.sort(key=lambda x: x['date'])
+        
+        # Logic: Find first game that is NOT "Final"
+        for game in games:
+            status = game['status'].strip() # e.g. "Final", "8:00 PM ET", "1st Qtr"
             
-    except Exception as e:
-        return f"Error finding schedule: {e}"
+            # If game is finished, skip it (it's in the past)
+            if status == "Final":
+                continue
+                
+            # We found the next active game!
+            home = game['home_team']['full_name']
+            visitor = game['visitor_team']['full_name']
+            date_str = game['date'].split("T")[0]
+            
+            if game['home_team']['id'] == team_id:
+                return f"vs {visitor}", f"{date_str} @ {status}"
+            else:
+                return f"@ {home}", f"{date_str} @ {status}"
+                
+        return None, "No upcoming games found (Season might be over/paused)."
+        
+    except Exception as e: return None, f"Error: {e}"
 
-# --- MAIN APP ---
+# --- MAIN APP LOGIC ---
 if bdl_key and openai_key:
     
     llm_coach = ChatOpenAI(model="gpt-4o", temperature=0.5, api_key=openai_key)
@@ -111,51 +127,56 @@ if bdl_key and openai_key:
     col1, col2 = st.columns(2)
     with col1: p_name = st.text_input("Player Name", "Luka Doncic")
     
-    if st.button("🚀 RUN ANALYSIS", type="primary"):
+    if st.button("🚀 RUN PRO ANALYSIS", type="primary"):
         
-        with st.spinner("Fetching Data from BallDontLie..."):
-            # 1. Find Player & Team
+        with st.spinner("🔍 Scouting Player & Schedule..."):
+            # 1. Find Player
             pid, full_name, team_data = get_player_data(p_name)
-            
             if not pid:
                 st.error("Player not found!")
                 st.stop()
-                
-            team_name = team_data['full_name']
-            team_id = team_data['id']
             
+            team_name = team_data['full_name']
             st.success(f"Found: {full_name} ({team_name})")
             
-            # 2. Get Schedule (Next Opponent)
-            next_opponent = get_next_game(team_id)
-            st.info(f"Next Game: {next_opponent}")
+            # 2. Smart Schedule Search
+            opponent, game_time = find_exact_next_game(team_data['id'])
             
-            # 3. Get Stats
-            stats_report = get_last_5_games(pid)
-            with st.expander("📊 Raw Game Logs", expanded=True):
-                st.code(stats_report)
+            if not opponent:
+                st.warning(f"Schedule Alert: {game_time}") # prints error msg
+                st.stop()
                 
-        # --- GPT ANALYSIS ---
+            st.info(f"📅 NEXT GAME: {opponent} | ⏰ {game_time}")
+            
+            # 3. Get Deep Stats
+            stats_report = get_advanced_stats(pid)
+            
+            with st.expander("📊 Read Deep Stats (Steals/Blocks/FG%)", expanded=True):
+                st.text(stats_report)
+                
+        # 4. AI Analysis
         if stats_report:
-            with st.spinner("GPT-4o is generating the game plan..."):
+            with st.spinner("🧠 GPT-4o is calculating win probability..."):
                 try:
                     prompt = f"""
-                    You are an Expert NBA Analyst.
+                    You are an Elite NBA Scout and Betting Analyst.
                     
-                    TARGET: {full_name} ({team_name})
-                    NEXT OPPONENT: {next_opponent}
-                    RECENT FORM (Last 5 Games):
+                    TARGET PLAYER: {full_name} ({team_name})
+                    NEXT MATCHUP: {opponent} (Time: {game_time})
+                    
+                    DEEP STATS (Last 5 Games):
                     {stats_report}
                     
-                    TASK:
-                    1. Analyze the player's trend (Hot/Cold?).
-                    2. Predict his stat line for the next game against {next_opponent}.
-                    3. Provide a betting recommendation (Over/Under on Points).
+                    YOUR MISSION:
+                    1. **Form Check:** Look at his FG% and Turnovers. Is he efficient or sloppy right now?
+                    2. **Defensive Impact:** Is he getting Steals/Blocks?
+                    3. **Prediction:** Project his stat line (PTS/REB/AST) for the upcoming game.
+                    4. **Verdict:** Give a specific "Player Prop" recommendation (e.g., "Over 28.5 Points").
                     """
                     
                     prediction = llm_coach.invoke(prompt).content
                     st.divider()
-                    st.markdown("### 🏆 Official Prediction")
+                    st.markdown("### 🏆 Official Scouting Report")
                     st.write(prediction)
                     
                 except Exception as e:
