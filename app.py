@@ -9,7 +9,7 @@ import difflib
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room (Ultimate)", page_icon="🏀", layout="wide")
 st.title("🏀 NBA War Room (Ultimate Edition)")
-st.markdown("**Stats:** BallDontLie | **Odds:** FanDuel (Props or Moneyline) | **Coach:** GPT-4o")
+st.markdown("**Stats:** BallDontLie | **Odds:** FanDuel | **Coach:** GPT-4o")
 
 # --- SECURE AUTHENTICATION ---
 def load_keys():
@@ -57,8 +57,28 @@ def get_bdl_headers():
 
 # --- TOOLS ---
 
+@st.cache_data(ttl=3600)
+def get_conference_rankings():
+    """Fetches standings to map Team ID -> 'West #4'"""
+    try:
+        url = f"{BDL_URL}/standings"
+        # 2024 covers the 2024-25 Season
+        params = {"season": "2024"} 
+        resp = requests.get(url, headers=get_bdl_headers(), params=params)
+        data = resp.json().get('data', [])
+        
+        rank_map = {}
+        for team in data:
+            t_id = team['team']['id']
+            conf = team['conference'].get('name', 'UNK')
+            rank = team['conference'].get('rank', 'N/A')
+            rank_map[t_id] = f"{conf} #{rank}"
+            
+        return rank_map
+    except: return {}
+
 def get_player_info_smart(user_input):
-    """Smart Search V2: Handles typos (Trigram method)"""
+    """Smart Search V2: Handles typos"""
     try:
         words = user_input.split()
         candidates = {} 
@@ -88,7 +108,6 @@ def get_player_info_smart(user_input):
     except Exception as e: return None, f"Search Error: {e}"
 
 def get_team_injuries(team_id):
-    """Fetches official injury report"""
     try:
         url = f"{BDL_URL}/player_injuries"
         resp = requests.get(url, headers=get_bdl_headers(), params={"team_ids[]": str(team_id)})
@@ -106,18 +125,16 @@ def get_team_injuries(team_id):
     except: return "Error fetching injuries."
 
 def get_team_schedule_before_today(team_id):
-    """Fetches TEAM'S last 7 finished games (EXTENDED HISTORY)"""
     try:
         url = f"{BDL_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
-        # Fetch more games to ensure we have enough 'Final' ones
-        params = {"team_ids[]": str(team_id), "seasons[]": "2025", "end_date": today, "per_page": "25"}
+        # Use 2024 for the 24-25 Season
+        params = {"team_ids[]": str(team_id), "seasons[]": "2024", "end_date": today, "per_page": "25"}
         resp = requests.get(url, headers=get_bdl_headers(), params=params)
         data = resp.json().get('data', [])
         finished = [g for g in data if g.get('status') == "Final"]
         finished.sort(key=lambda x: x['date'], reverse=True)
-        # UPDATED: Return 7 games instead of 5
-        return finished[:7]
+        return finished[:7] # Last 7 games
     except: return []
 
 def get_stats_for_games(player_id, game_ids):
@@ -134,12 +151,11 @@ def get_next_game(team_id):
         url = f"{BDL_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
         future = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
-        params = {"team_ids[]": str(team_id), "seasons[]": "2025", "start_date": today, "end_date": future, "per_page": "10"}
+        params = {"team_ids[]": str(team_id), "seasons[]": "2024", "start_date": today, "end_date": future, "per_page": "10"}
         resp = requests.get(url, headers=get_bdl_headers(), params=params)
         data = resp.json().get('data', [])
-        if not data: return None, "No games found.", None, None
-        
         data.sort(key=lambda x: x['date'])
+        
         game = next((g for g in data if g['status'] != "Final"), None)
         if not game: return None, "No upcoming games.", None, None
         
@@ -153,17 +169,10 @@ def get_next_game(team_id):
     except: return None, "Error", None, None
 
 def get_betting_odds(player_name, team_name):
-    """
-    Fetches Betting Lines.
-    STRATEGY:
-    1. Try Player Props (Points, etc.) first.
-    2. If no props found, FALLBACK to Game Moneyline (H2H).
-    """
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key: return "Odds API Key missing."
 
     try:
-        # 1. Get Games
         games_resp = requests.get(f"{ODDS_URL}/events", params={"apiKey": api_key, "regions": "us"})
         games = games_resp.json()
         
@@ -174,13 +183,10 @@ def get_betting_odds(player_name, team_name):
         for g in games:
             if team_name in g['home_team'] or team_name in g['away_team']:
                 game_id = g['id']
-                home_team = g['home_team']
-                away_team = g['away_team']
                 break
         
         if not game_id: return f"No active betting lines found for {team_name}."
 
-        # 2. Try Player Props First
         props_resp = requests.get(
             f"{ODDS_URL}/events/{game_id}/odds",
             params={
@@ -204,10 +210,9 @@ def get_betting_odds(player_name, team_name):
                         price = outcome.get('price', 'N/A')
                         lines.append(f"**{market_name}**: {line} ({price})")
         
-        if lines:
-            return " | ".join(lines)
+        if lines: return " | ".join(lines)
             
-        # 3. Fallback to Moneyline (H2H) if no props found
+        # Fallback to Moneyline
         h2h_resp = requests.get(
             f"{ODDS_URL}/events/{game_id}/odds",
             params={
@@ -223,7 +228,7 @@ def get_betting_odds(player_name, team_name):
         if bm_h2h:
             outcomes = bm_h2h[0]['markets'][0]['outcomes']
             odds_str = " vs ".join([f"{o['name']} ({o['price']})" for o in outcomes])
-            return f"Props not ready. **Game Odds:** {odds_str}"
+            return f"Props Pending. **Moneyline:** {odds_str}"
             
         return "No odds available."
 
@@ -262,21 +267,24 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             tname = player_obj['team']['full_name']
             st.success(msg)
 
-            # 2. Schedule
+            # 2. Rankings
+            rank_map = get_conference_rankings()
+
+            # 3. Schedule
             status_box.write("Checking schedule...")
             opp_str, date, opp_id, opp_name = get_next_game(tid)
             if not opp_str: opp_name = "Unknown"
 
-            # 3. Betting Odds (With Fallback)
-            status_box.write("Checking Lines...")
+            # 4. Odds
+            status_box.write("Checking Betting Lines...")
             betting_lines = get_betting_odds(f"{fname} {lname}", tname)
 
-            # 4. Injuries
+            # 5. Injuries
             status_box.write("Fetching Injuries...")
             inj_home = get_team_injuries(tid) if tid else "N/A"
             inj_opp = get_team_injuries(opp_id) if opp_id else "N/A"
 
-            # 5. Stats (7 Games + Strict DNP)
+            # 6. Stats (Team Schedule First)
             status_box.write("Crunching stats...")
             past_games = get_team_schedule_before_today(tid)
             gids = [g['id'] for g in past_games]
@@ -287,33 +295,41 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                 gid = g['id']
                 d = g['date'].split("T")[0]
                 
-                home = g.get('home_team', {})
-                visitor = g.get('visitor_team', {})
+                # Score & Result Logic
+                home_score = g['home_team_score']
+                visit_score = g['visitor_team_score']
                 
-                if home.get('id') == tid:
-                    opp_abbr = visitor.get('abbreviation', 'UNK')
+                if g['home_team']['id'] == tid:
+                    opp = g['visitor_team']
                     loc = "vs"
+                    my_score, their_score = home_score, visit_score
                 else:
-                    opp_abbr = home.get('abbreviation', 'UNK')
+                    opp = g['home_team']
                     loc = "@"
+                    my_score, their_score = visit_score, home_score
                 
+                wl = "W" if my_score > their_score else "L"
+                score_str = f"{wl} {my_score}-{their_score}"
+                
+                # Opponent Rank
+                opp_rank = rank_map.get(opp['id'], "")
+                opp_display = f"{opp['abbreviation']} {opp_rank}"
+                
+                # Stat Line
                 stat = next((s for s in p_stats if s['game']['id'] == gid), None)
                 
-                # STRICT DNP CHECK
-                # Check for None, "0", "00:00", or 0 integer
-                min_val = stat.get('min') if stat else None
-                if min_val and str(min_val) != "0" and str(min_val) != "00:00" and str(min_val) != "":
+                if stat and stat.get('min') and stat['min'] != "00:00" and stat['min'] != "0":
                     fg = f"{stat['fg_pct']*100:.0f}%" if stat.get('fg_pct') else "0%"
-                    fg3 = f"{stat.get('fg3m', 0)}/{stat.get('fg3a', 0)}"
-                    line = f"MIN:{min_val} | PTS:{stat.get('pts',0)} REB:{stat.get('reb',0)} AST:{stat.get('ast',0)} | FG:{fg} 3PT:{fg3}"
+                    fg3 = f"{stat.get('fg3m',0)}/{stat.get('fg3a',0)}"
+                    line = f"MIN:{stat.get('min')} | PTS:{stat.get('pts')} REB:{stat.get('reb')} AST:{stat.get('ast')} | FG:{fg} 3PT:{fg3}"
                 else:
                     line = "⛔ DNP (Did Not Play)"
                     
-                log_lines.append(f"[{d}] {loc} {opp_abbr} | {line}")
+                log_lines.append(f"[{d}] {score_str} | {loc} {opp_display} | {line}")
             
             final_log = "\n".join(log_lines)
             
-            # 6. GPT Analysis
+            # 7. GPT Analysis
             status_box.write("Consulting Coach...")
             prompt = f"""
             Role: Expert Sports Bettor.
@@ -331,9 +347,10 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             {final_log}
             
             Tasks:
-            1. **Line Value:** Compare stats to the Odds (if Player Props available).
-            2. **Prediction:** Project Points/Rebounds/Assists.
-            3. **Recommendation:** Suggest a bet (Prop or Moneyline).
+            1. **Context:** Analyze the quality of recent opponents (Rank) and game results (W/L).
+            2. **Line Value:** Compare stats to the Odds.
+            3. **Prediction:** Project Points/Rebounds/Assists.
+            4. **Verdict:** "Over" or "Under"?
             """
             analysis = llm.invoke(prompt).content
             
@@ -362,7 +379,6 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
     
     if data:
         st.divider()
-        # Safe Access to avoid KeyErrors
         p_label = data.get('player', 'Unknown')
         m_label = data.get('matchup', 'Unknown')
         d_label = data.get('date', '')
