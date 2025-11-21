@@ -12,29 +12,25 @@ import os
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room (Hybrid)", page_icon="🏀")
 st.title("🏀 Hybrid AI War Room")
-st.markdown("**Scout:** Gemini Pro (Data) | **Coach:** GPT-4o (Prediction)")
+st.markdown("**Scout:** Gemini (Free/REST) | **Coach:** GPT-4o (Paid)")
 
 # --- SIDEBAR: DUAL KEYS ---
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    # 1. Google Key (For the heavy lifting)
-    google_key = st.text_input("Google Gemini Key (The Scout)", type="password")
+    google_key = st.text_input("Google Gemini Key", type="password")
     st.markdown("[Get Free Google Key](https://aistudio.google.com/app/apikey)")
     
-    # 2. OpenAI Key (For the final verdict)
-    openai_key = st.text_input("OpenAI API Key (The Coach)", type="password")
+    openai_key = st.text_input("OpenAI API Key", type="password")
     st.markdown("[Get OpenAI Key](https://platform.openai.com/account/api-keys)")
     
-    if google_key:
-        os.environ["GOOGLE_API_KEY"] = google_key
-    if openai_key:
-        os.environ["OPENAI_API_KEY"] = openai_key
+    if google_key: os.environ["GOOGLE_API_KEY"] = google_key
+    if openai_key: os.environ["OPENAI_API_KEY"] = openai_key
     
     if not google_key or not openai_key:
         st.warning("⚠️ You need BOTH keys for Hybrid Mode.")
 
-# --- TOOLS (Gemini uses these) ---
+# --- TOOLS ---
 def get_last_5_games_stats(player_name):
     try:
         nba_players = players.get_players()
@@ -60,7 +56,13 @@ search = DuckDuckGoSearchRun()
 # --- MAIN APP LOGIC ---
 if google_key and openai_key:
     # 1. THE SCOUT (Gemini)
-    llm_scout = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0, google_api_key=google_key)
+    # FIX: We added transport="rest" to stop the Event Loop crash
+    llm_scout = ChatGoogleGenerativeAI(
+        model="gemini-1.5-pro", 
+        temperature=0, 
+        google_api_key=google_key,
+        transport="rest"
+    )
 
     tools = [
         Tool(name="GetLast5Games", func=get_last_5_games_stats, description="Get recent player stats."),
@@ -86,7 +88,6 @@ if google_key and openai_key:
 
     if st.button("🚀 RUN HYBRID ANALYSIS", type="primary"):
         
-        # --- STEP 1: GEMINI SCOUTING ---
         scouting_report = ""
         with st.spinner("Step 1: Gemini is scouting the data..."):
             try:
@@ -100,19 +101,17 @@ if google_key and openai_key:
                 2. Get {opponent}'s tactics (Pace/Defense).
                 3. Search for {opponent}'s injury report.
                 
-                Output a detailed "Scouting Report" summarizing the data. 
-                Do not make a prediction yet, just list the facts.
+                Output a detailed "Scouting Report" summarizing the data.
                 """
                 scouting_report = scout_agent.invoke({"input": scout_prompt})['output']
                 
-                with st.expander("📄 Read Gemini's Scouting Report"):
+                with st.expander("📄 Read Scouting Report"):
                     st.write(scouting_report)
 
             except Exception as e:
                 st.error(f"Scouting Error: {e}")
                 st.stop()
 
-        # --- STEP 2: GPT-4o COACHING ---
         if scouting_report:
             with st.spinner("Step 2: GPT-4o is making the game plan..."):
                 try:
