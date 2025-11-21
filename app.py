@@ -9,7 +9,7 @@ import difflib
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room (Ultimate)", page_icon="🏀", layout="wide")
 st.title("🏀 NBA War Room (Ultimate Edition)")
-st.markdown("**Stats:** BallDontLie | **Odds:** FanDuel (Props or Moneyline) | **Coach:** GPT-4o")
+st.markdown("**Stats:** BallDontLie | **Odds:** The Odds API (Multi-Book Moneyline) | **Coach:** GPT-4o")
 
 # --- SECURE AUTHENTICATION ---
 def load_keys():
@@ -54,28 +54,27 @@ if "analysis_data" not in st.session_state:
 # --- API CONFIG ---
 BDL_URL = "https://api.balldontlie.io/v1"
 ODDS_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba"
+REQUEST_TIMEOUT = 10  # seconds
 
 def get_bdl_headers():
-    """Return headers for BallDontLie requests with Bearer auth."""
+    """Return headers for BallDontLie requests (no Bearer prefix, per docs)."""
     key = os.environ.get("BDL_API_KEY")
     if not key:
         return {}
-    return {"Authorization": f"Bearer {key}"}
+    return {"Authorization": key}
 
 def get_current_season() -> int:
     """
-    Compute current NBA season year.
+    Compute current NBA season year (year the season starts).
     If month >= October, season is this year, else previous year.
     """
     today = datetime.today()
     return today.year if today.month >= 10 else today.year - 1
 
-REQUEST_TIMEOUT = 10  # seconds
-
 # --- TOOLS ---
 
 def get_player_info_smart(user_input):
-    """Smart Search V2: Handles typos (Trigram method) with basic error handling."""
+    """Smart Search V2: Handles typos (trigram-ish search) with basic error handling."""
     try:
         words = user_input.split()
         candidates = {} 
@@ -147,7 +146,7 @@ def get_team_injuries(team_id):
         return f"Error fetching injuries: {e}"
 
 def get_team_schedule_before_today(team_id, n_games: int = 7):
-    """Fetches TEAM'S last n finished games (EXTENDED HISTORY) with error handling."""
+    """Fetches team's last n finished games (extended history) with error handling."""
     try:
         url = f"{BDL_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
@@ -247,12 +246,6 @@ def get_betting_odds(player_name, team_name, bookmakers: str = None):
         - Taken from a single bookmaker (prefer FanDuel, else first).
     - Moneyline:
         - Collected from ALL bookmakers in the response (all betting choices).
-
-    :param player_name: "First Last"
-    :param team_name: Full team name from BallDontLie
-    :param bookmakers: Optional comma-separated list of bookmaker keys
-                       (e.g. "fanduel,draftkings,betmgm").
-                       If None, API will return its default set.
     """
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
@@ -354,7 +347,6 @@ def get_betting_odds(player_name, team_name, bookmakers: str = None):
             outcomes = h2h_market.get("outcomes", [])
             if len(outcomes) < 2:
                 continue
-            # Build "Book: TeamA (+135) vs TeamB (-150)"
             parts = [f"{o.get('name', 'Team')} ({o.get('price', 'N/A')})" for o in outcomes]
             ml_str = " vs ".join(parts)
             moneyline_lines.append(f"- **{b_title}**: {ml_str}")
@@ -376,6 +368,164 @@ def get_betting_odds(player_name, team_name, bookmakers: str = None):
 
     except Exception as e:
         return f"Error fetching odds: {e}"
+
+def compute_team_form(past_games, team_id):
+    """Compute simple PF/PA/net and record for last N games."""
+    if not past_games:
+        return {"pf": 0.0, "pa": 0.0, "net": 0.0, "wins": 0, "losses": 0}
+    pf_total = 0
+    pa_total = 0
+    wins = 0
+    losses = 0
+    games_counted = 0
+
+    for g in past_games:
+        home = g.get("home_team", {})
+        visitor = g.get("visitor_team", {})
+        hs = g.get("home_team_score", 0)
+        vs = g.get("visitor_team_score", 0)
+
+        if home.get("id") == team_id:
+            team_score = hs
+            opp_score = vs
+        elif visitor.get("id") == team_id:
+            team_score = vs
+            opp_score = hs
+        else:
+            continue  # should not happen
+
+        pf_total += team_score
+        pa_total += opp_score
+        games_counted += 1
+        if team_score > opp_score:
+            wins += 1
+        elif team_score < opp_score:
+            losses += 1
+
+    if games_counted == 0:
+        return {"pf": 0.0, "pa": 0.0, "net": 0.0, "wins": 0, "losses": 0}
+
+    pf = pf_total / games_counted
+    pa = pa_total / games_counted
+    net = pf - pa
+    return {"pf": pf, "pa": pa, "net": net, "wins": wins, "losses": losses}
+
+def parse_minutes(min_str):
+    """Convert min field ('38' or '38:21') to float minutes."""
+    if not min_str:
+        return 0.0
+    s = str(min_str)
+    if s in ("0", "00:00", ""):
+        return 0.0
+    if ":" in s:
+        try:
+            m, sec = s.split(":")
+            return int(m) + int(sec) / 60.0
+        except Exception:
+            try:
+                return float(m)
+            except Exception:
+                return 0.0
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def get_team_players(team_id):
+    """Fetch current roster (players + positions) for a team."""
+    try:
+        resp = requests.get(
+            f"{BDL_URL}/players",
+            headers=get_bdl_headers(),
+            params={"team_ids[]": str(team_id), "per_page": 100},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return {}
+        data = resp.json().get("data", [])
+        players = {}
+        for p in data:
+            pid = p.get("id")
+            players[pid] = {
+                "name": f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
+                "position": p.get("position", ""),
+            }
+        return players
+    except Exception:
+        return {}
+
+def get_team_rotation(team_id, n_games: int = 7):
+    """
+    Approximate rotation for a team:
+    - Uses last n games' stats.
+    - Aggregates minutes per player.
+    - Labels top 5 by avg minutes as 'Starter', rest as 'Bench/Rotation'.
+    """
+    past_games = get_team_schedule_before_today(team_id, n_games=n_games)
+    if not past_games:
+        return []
+
+    game_ids = [g["id"] for g in past_games]
+    try:
+        url = f"{BDL_URL}/stats"
+        params = {
+            "game_ids[]": [str(g) for g in game_ids],
+            "per_page": 100,
+        }
+        resp = requests.get(
+            url,
+            headers=get_bdl_headers(),
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return []
+        stats = resp.json().get("data", [])
+    except Exception:
+        return []
+
+    # Aggregate minutes for this team only
+    per_player = {}
+    for s in stats:
+        team = s.get("team") or {}
+        if team.get("id") != team_id:
+            continue
+        player = s.get("player") or {}
+        pid = player.get("id")
+        if not pid:
+            continue
+        min_val = parse_minutes(s.get("min"))
+        if pid not in per_player:
+            per_player[pid] = {"total_min": 0.0, "games_played": 0}
+        per_player[pid]["total_min"] += min_val
+        if min_val > 0:
+            per_player[pid]["games_played"] += 1
+
+    if not per_player:
+        return []
+
+    roster = get_team_players(team_id)
+    rows = []
+    for pid, agg in per_player.items():
+        gp = agg["games_played"] or 1
+        avg_min = agg["total_min"] / gp
+        info = roster.get(pid, {})
+        rows.append(
+            {
+                "Player ID": pid,
+                "Name": info.get("name", f"Player {pid}"),
+                "Pos": info.get("position", ""),
+                "Avg MIN": round(avg_min, 1),
+                "Games Played": agg["games_played"],
+            }
+        )
+
+    # Sort by avg minutes
+    rows.sort(key=lambda r: r["Avg MIN"], reverse=True)
+    # Label roles
+    for idx, r in enumerate(rows):
+        r["Role"] = "Starter" if idx < 5 else "Bench/Rotation"
+    return rows
 
 # --- MAIN LOGIC ---
 if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
@@ -410,14 +560,16 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             tname = player_obj["team"]["full_name"]
             st.success(msg)
 
-            # 2. Schedule
+            # 2. Schedule / Next Game
             status_box.write("Checking schedule...")
             opp_str, date, opp_id, opp_name = get_next_game(tid)
             if not opp_str:
                 opp_name = "Unknown"
 
-            # 3. Betting Odds (With Fallback)
+            # 3. Betting Odds (props + multi-book moneyline)
             status_box.write("Checking Lines...")
+            # You can pass explicit books here if you want to limit:
+            # bookmakers="fanduel,draftkings,betmgm"
             betting_lines = get_betting_odds(f"{fname} {lname}", tname)
 
             # 4. Injuries
@@ -425,7 +577,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             inj_home = get_team_injuries(tid) if tid else "N/A"
             inj_opp = get_team_injuries(opp_id) if opp_id else "N/A"
 
-            # 5. Stats (Last 7 Games + Strict DNP)
+            # 5. Home Team Stats (Last 7 Games + Strict DNP)
             status_box.write("Crunching stats...")
             past_games = get_team_schedule_before_today(tid, n_games=7)
             gids = [g["id"] for g in past_games]
@@ -469,7 +621,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
 
                 log_lines.append(f"[{d}] {loc} {opp_abbr} | {line}")
 
-                # NEW FEATURE: collect structured stats for DataFrame/chart
+                # Structured stats for DataFrame/chart
                 stats_rows.append(
                     {
                         "Date": d,
@@ -485,7 +637,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
 
             final_log = "\n".join(log_lines)
 
-            # NEW FEATURE: Opponent team's last 7 results
+            # 6. Opponent team's last 7 results
             opp_results_rows = []
             if opp_id:
                 opp_past_games = get_team_schedule_before_today(opp_id, n_games=7)
@@ -525,8 +677,14 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                             "Result": result,
                         }
                     )
-            
-            # 6. GPT Analysis
+
+            # 7. Team form snapshot (strength/weakness proxy)
+            team_form = compute_team_form(past_games, tid)
+
+            # 8. Team rotation (positions + avg minutes)
+            rotation_rows = get_team_rotation(tid, n_games=7)
+
+            # 9. GPT Analysis
             status_box.write("Consulting Coach...")
             prompt = f"""
             Role: Expert Sports Bettor.
@@ -543,10 +701,17 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             RECENT FORM (Last 7 Games):
             {final_log}
             
+            TEAM FORM (Last 7 Games):
+            - Avg Points For: {team_form.get('pf', 0):.1f}
+            - Avg Points Against: {team_form.get('pa', 0):.1f}
+            - Approx Net Rating: {team_form.get('net', 0):+.1f}
+            - Record: {team_form.get('wins', 0)}–{team_form.get('losses', 0)}
+            
             Tasks:
             1. **Line Value:** Compare stats to the Odds (if Player Props available).
             2. **Prediction:** Project Points/Rebounds/Assists.
             3. **Recommendation:** Suggest a bet (Prop or Moneyline).
+            4. **Team View:** Briefly describe this team's current offensive and defensive strengths/weaknesses based on the form.
             Rules:
             - Do NOT guarantee outcomes.
             - Use language like "lean", "edge", "high variance" instead of certainty.
@@ -567,6 +732,9 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                 "stats_rows": stats_rows,
                 "opp_results_rows": opp_results_rows,
                 "opp_name": opp_name,
+                "team_form": team_form,
+                "rotation_rows": rotation_rows,
+                "team_name": tname,
             }
             st.session_state.messages = [{"role": "assistant", "content": analysis}]
             status_box.update(label="Ready!", state="complete", expanded=False)
@@ -589,19 +757,39 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
         st.markdown(f"### 📊 Report: {p_label} {m_label}")
         st.caption(f"Date: {d_label}")
         
-        st.info(f"🎰 **FanDuel Odds:**\n\n{data.get('odds', 'No odds data')}")
+        st.info(f"🎰 **Market Odds:**\n\n{data.get('odds', 'No odds data')}")
 
-        # NEW FEATURE: show recent stats table + chart
+        # Team Form metrics (strength/weakness proxy)
+        team_form = data.get("team_form") or {}
+        if team_form:
+            st.subheader("📈 Team Form (Last 7 Games)")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Offense (PF)", f"{team_form.get('pf', 0):.1f} PPG")
+            c2.metric("Defense (PA)", f"{team_form.get('pa', 0):.1f} PPG")
+            c3.metric("Net Rating (approx)", f"{team_form.get('net', 0):+.1f}")
+            c4.metric("Record", f"{team_form.get('wins', 0)}–{team_form.get('losses', 0)}")
+
+        # Rotation & Positions
+        rotation_rows = data.get("rotation_rows")
+        if rotation_rows:
+            st.subheader(f"🧩 {data.get('team_name', 'Team')} Rotation & Positions (Last 7 Games)")
+            df_rot = pd.DataFrame(rotation_rows)
+            # Hide internal Player ID column from display
+            if "Player ID" in df_rot.columns:
+                df_rot = df_rot.drop(columns=["Player ID"])
+            st.dataframe(df_rot, use_container_width=True)
+
+        # Player recent stats table + chart
         stats_rows = data.get("stats_rows")
         if stats_rows:
-            st.subheader("Recent Game Log (Last 7)")
+            st.subheader("📜 Player Game Log (Last 7)")
             df_stats = pd.DataFrame(stats_rows)
             st.dataframe(df_stats, use_container_width=True)
 
-            # NEW FEATURE: Last game where player actually played (non-DNP)
+            # Last game where player actually played (non-DNP)
             last_played = next((row for row in stats_rows if not row["Is_DNP"]), None)
             if last_played:
-                st.subheader("Last Game Played (Most Recent Non-DNP)")
+                st.subheader("🎯 Last Game Played (Most Recent Non-DNP)")
                 st.table(
                     pd.DataFrame(
                         [
@@ -628,15 +816,15 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                 # Fail silently if charting has any issue
                 pass
 
-        # NEW FEATURE: Opponent team last 7 results
+        # Opponent team last 7 results
         opp_rows = data.get("opp_results_rows")
         if opp_rows:
             opp_name = data.get("opp_name", "Opponent Team")
-            st.subheader(f"{opp_name} – Recent Results (Last 7)")
+            st.subheader(f"📉 {opp_name} – Recent Results (Last 7)")
             df_opp = pd.DataFrame(opp_rows)
             st.dataframe(df_opp, use_container_width=True)
         
-        with st.expander("View Stats & Injuries", expanded=False):
+        with st.expander("View Raw Logs & Injuries", expanded=False):
             c1, c2 = st.columns(2)
             c1.warning(f"Home Injuries:\n{data.get('inj_home', 'N/A')}")
             c2.error(f"Away Injuries:\n{data.get('inj_opp', 'N/A')}")
@@ -652,7 +840,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                 st.markdown(msg["content"])
         
         if val := st.chat_input("Ask follow-up..."):
-            st.session_state.messages.append({"role": 'user', "content": val})
+            st.session_state.messages.append({"role": "user", "content": val})
             with st.chat_message("user"):
                 st.markdown(val)
             with st.chat_message("assistant"):
