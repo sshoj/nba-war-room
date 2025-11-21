@@ -28,16 +28,16 @@ with st.sidebar:
     openai_key = openai_key_input.strip() if openai_key_input else None
     st.markdown("[Get OpenAI Key](https://platform.openai.com/account/api-keys)")
     
-    # CRITICAL CHECK: Stop if keys are missing
-    if not google_key or not openai_key:
-        st.warning("⚠️ Please enter BOTH API keys to unlock the War Room.")
-        # This stops the app from running any further code until keys are present
-        st.stop()
-
-    os.environ["GOOGLE_API_KEY"] = google_key
-    os.environ["OPENAI_API_KEY"] = openai_key
+    if google_key: os.environ["GOOGLE_API_KEY"] = google_key
+    if openai_key: os.environ["OPENAI_API_KEY"] = openai_key
+    
+    st.divider()
+    st.info("If the AI cannot find the schedule, enter the opponent manually below.")
+    # MANUAL OVERRIDE: Solves the "Schedule not available" error
+    manual_opponent = st.text_input("Manual Opponent (Optional)", placeholder="e.g. Pelicans")
 
 # --- CONFIG: NBA HEADERS (Anti-Blocking) ---
+# This disguises the app as a real browser to avoid being blocked by NBA.com
 custom_headers = {
     'Host': 'stats.nba.com',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
@@ -46,23 +46,24 @@ custom_headers = {
     'Connection': 'keep-alive',
 }
 
-# --- TOOLS (With Error Handling) ---
+# --- TOOLS (With Robust Error Handling) ---
 def get_last_5_games_stats(player_name):
     try:
         # 1. Find Player
         nba_players = players.get_players()
-        # Fuzzy match (case insensitive)
-        player = next((p for p in nba_players if player_name.lower() in p['full_name'].lower()), None)
+        # Clean input and fuzzy match
+        clean_name = player_name.strip().lower()
+        player = next((p for p in nba_players if clean_name in p['full_name'].lower()), None)
         
         if not player: 
-            return f"Error: Player '{player_name}' not found. Please check spelling."
+            return f"Error: Player '{player_name}' not found. Check spelling."
         
         # 2. Fetch Stats (Safe Mode)
         gamelog = playergamelog.PlayerGameLog(
             player_id=player['id'], 
-            season='2025-26', 
+            season='2025-26',  # Correct Season
             headers=custom_headers,
-            timeout=10 # Don't wait forever
+            timeout=15
         )
         df = gamelog.get_data_frames()[0]
         
@@ -73,7 +74,6 @@ def get_last_5_games_stats(player_name):
         return df[cols].head(5).to_string(index=False)
         
     except Exception as e:
-        # Return the error as text so the AI knows something went wrong
         return f"API Error retrieving stats: {str(e)}"
 
 def get_team_tactics(team_name):
@@ -82,10 +82,11 @@ def get_team_tactics(team_name):
             measure_type='Advanced', 
             season='2025-26', 
             headers=custom_headers,
-            timeout=10
+            timeout=15
         )
         df = stats.get_data_frames()[0]
         
+        # Fuzzy match team name (e.g., "Pelicans" matches "New Orleans Pelicans")
         team_stats = df[df['TEAM_NAME'].str.contains(team_name, case=False, na=False)]
         
         if team_stats.empty: 
@@ -101,8 +102,13 @@ search = DuckDuckGoSearchRun()
 
 # --- MAIN APP LOGIC ---
 
-# 1. Initialize Agents (Safe Wrap)
+if not google_key or not openai_key:
+    st.warning("⚠️ Please enter both API Keys in the sidebar to start.")
+    st.stop()
+
+# 1. Initialize Agents
 try:
+    # SCOUT: Gemini 2.5 Flash (Stable/Free)
     llm_scout = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash", 
         temperature=0, 
@@ -124,6 +130,7 @@ try:
         handle_parsing_errors=True
     )
 
+    # COACH: GPT-4o
     llm_coach = ChatOpenAI(model="gpt-4o", temperature=0.5, api_key=openai_key)
 
 except Exception as e:
@@ -137,34 +144,39 @@ with col2: p_team = st.text_input("Player Team", "Dallas Mavericks")
 
 if st.button("🚀 RUN HYBRID ANALYSIS", type="primary"):
     
-    # Validate Inputs
-    if not p_name or not p_team:
-        st.error("Please enter both a Player Name and a Team Name.")
-        st.stop()
-
     scouting_report = ""
     
     # --- PHASE 1: SCOUTING ---
     with st.spinner("Step 1: Gemini 2.5 (Scout) is gathering data..."):
         try:
-            # 1. Find Opponent
-            opp_query = f"Who is the {p_team} playing next in Nov 2025? Return ONLY the team name."
-            opponent_raw = scout_agent.invoke({"input": opp_query})['output']
+            # 1. Determine Opponent
+            opponent_final = ""
             
-            if "Error" in opponent_raw or "unable" in opponent_raw.lower():
-                st.warning(f"⚠️ Scout couldn't find the next opponent automatically. Defaulting to manual search.")
-                opponent_raw = "Unknown Opponent"
+            if manual_opponent:
+                # USE MANUAL OVERRIDE IF AVAILABLE
+                opponent_final = manual_opponent
+                st.success(f"Matchup (Manual): vs {opponent_final}")
             else:
-                st.info(f"Matchup Identified: vs {opponent_raw}")
+                # TRY AUTO-DETECT
+                opp_query = f"Who is the {p_team} playing next in November 2025? Return ONLY the team name."
+                opponent_raw = scout_agent.invoke({"input": opp_query})['output']
+                
+                # Check for failed search
+                if len(opponent_raw) > 50 or "schedule" in opponent_raw.lower():
+                    st.error("⚠️ Auto-detection failed. Please enter the opponent name manually in the sidebar.")
+                    st.stop()
+                else:
+                    opponent_final = opponent_raw
+                    st.info(f"Matchup (Auto): vs {opponent_final}")
             
-            # 2. Gather Stats
+            # 2. Gather Stats with confirmed opponent
             scout_prompt = f"""
-            Gather intelligence for {p_name} ({p_team}) vs {opponent_raw}.
+            Gather intelligence for {p_name} ({p_team}) vs {opponent_final}.
             1. Use 'GetLast5Games' to get {p_name}'s stats.
-            2. Use 'GetTeamTactics' to get {opponent_raw}'s tactics.
-            3. Use 'WebSearch' to find {opponent_raw}'s injury report.
+            2. Use 'GetTeamTactics' to get {opponent_final}'s tactics.
+            3. Use 'WebSearch' to find {opponent_final}'s injury report.
             
-            Output a detailed "Scouting Report". If any data is missing, state it clearly.
+            Output a detailed "Scouting Report".
             """
             scouting_report = scout_agent.invoke({"input": scout_prompt})['output']
             
@@ -173,7 +185,6 @@ if st.button("🚀 RUN HYBRID ANALYSIS", type="primary"):
 
         except Exception as e:
             st.error(f"❌ Scouting Mission Failed: {str(e)}")
-            # We stop here because without a scouting report, the Coach can't work
             st.stop()
 
     # --- PHASE 2: COACHING ---
@@ -190,8 +201,6 @@ if st.button("🚀 RUN HYBRID ANALYSIS", type="primary"):
                 1. Predict the Winner.
                 2. Estimate the Score.
                 3. Give one "Key to the Game".
-                
-                If the scouting report contains errors or missing data, acknowledge that in your risk assessment.
                 """
                 final_prediction = llm_coach.invoke(coach_prompt)
                 
