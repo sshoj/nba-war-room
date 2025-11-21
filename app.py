@@ -1,112 +1,210 @@
 import streamlit as st
+import requests
 from langchain_openai import ChatOpenAI
-from duckduckgo_search import DDGS
 import os
+from datetime import datetime, timedelta
 import time
-import random
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="NBA War Room (Web)", page_icon="🏀", layout="wide")
-st.title("🏀 NBA War Room (Web Researcher)")
-st.markdown("**Source:** Web Search (StatMuse/ESPN) | **Coach:** GPT-4o")
+st.set_page_config(page_title="NBA War Room (RapidAPI)", page_icon="🏀", layout="wide")
+st.title("🏀 NBA War Room (RapidAPI Pro)")
+st.markdown("**Data:** RapidAPI (Unblockable) | **Logic:** Deep Stats | **Coach:** GPT-4o")
 
-# --- SIDEBAR ---
+# --- SIDEBAR: SETTINGS ---
 with st.sidebar:
     st.header("⚙️ Settings")
-    openai_key_input = st.text_input("OpenAI API Key", type="password")
-    if openai_key_input: os.environ["OPENAI_API_KEY"] = openai_key_input.strip()
     
-    st.divider()
-    st.info("This version searches the web for stats, so no RapidAPI key is needed.")
-    manual_opponent = st.text_input("Manual Opponent (Optional)", placeholder="e.g. Celtics")
+    # 1. RAPID API KEY
+    rapid_key_input = st.text_input("X-RapidAPI-Key", type="password")
+    st.caption("Use your RapidAPI key (starts with 'fc...')")
+    st.markdown("[Get Free Key](https://rapidapi.com/theapiguy/api/free-nba)")
+    
+    # 2. OPENAI KEY
+    openai_key_input = st.text_input("OpenAI API Key", type="password")
+    
+    if rapid_key_input: os.environ["RAPID_KEY"] = rapid_key_input.strip()
+    if openai_key_input: os.environ["OPENAI_API_KEY"] = openai_key_input.strip()
 
-# --- ROBUST SEARCH TOOL ---
-def search_web(query):
-    """
-    Searches DuckDuckGo using the 'html' backend to avoid rate limits.
-    Retries 3 times if it fails.
-    """
-    for attempt in range(3):
-        try:
-            # Sleep to mimic human behavior
-            time.sleep(random.uniform(1, 3))
-            
-            with DDGS() as ddgs:
-                # backend='html' is slower but much safer from blocks
-                results = list(ddgs.text(query, backend="html", max_results=3))
+# --- RAPID API CONFIG ---
+RAPID_HOST = "free-nba.p.rapidapi.com"
+
+def get_headers():
+    return {
+        "X-RapidAPI-Key": os.environ.get("RAPID_KEY"),
+        "X-RapidAPI-Host": RAPID_HOST
+    }
+
+# --- TOOLS ---
+def get_player_data(player_name):
+    """Finds Player ID and Team ID"""
+    try:
+        url = f"https://{RAPID_HOST}/players"
+        params = {"search": player_name, "per_page": "1"}
+        resp = requests.get(url, headers=get_headers(), params=params, timeout=10)
+        data = resp.json()['data']
+        
+        if not data: return None, None, None
+        
+        p = data[0]
+        return p['id'], f"{p['first_name']} {p['last_name']}", p['team']
+    except Exception as e:
+        return None, None, str(e)
+
+def find_next_game(team_id):
+    """Finds the exact next scheduled game (ignoring past games)"""
+    try:
+        url = f"https://{RAPID_HOST}/games"
+        # Search 7-day window
+        today = datetime.now().strftime("%Y-%m-%d")
+        next_week = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        
+        params = {
+            "team_ids[]": str(team_id),
+            "start_date": today,
+            "end_date": next_week,
+            "per_page": "10"
+        }
+        resp = requests.get(url, headers=get_headers(), params=params, timeout=10)
+        games = resp.json()['data']
+        
+        if not games: return "No games scheduled soon.", "TBD"
+        
+        # Sort by date to get the soonest
+        games.sort(key=lambda x: x['date'])
+        
+        # Find first non-final game
+        for g in games:
+            if g['status'] != "Final":
+                # Found it!
+                home = g['home_team']['full_name']
+                visitor = g['visitor_team']['full_name']
                 
-            if results:
-                # Combine the top 3 search snippets into one text block
-                return "\n\n".join([f"Source {i+1}: {r['body']}" for i, r in enumerate(results)])
+                # Clean Time format
+                try:
+                    # API often returns ISO format like '2025-11-22T00:00:00.000Z'
+                    dt = datetime.strptime(g['date'], "%Y-%m-%dT%H:%M:%S.%fZ")
+                    clean_time = dt.strftime("%a, %b %d")
+                except:
+                    clean_time = g['date'].split("T")[0]
+
+                if g['home_team']['id'] == team_id:
+                    return f"vs {visitor}", clean_time
+                else:
+                    return f"@ {home}", clean_time
+                    
+        return "No upcoming games (Season Paused/Ended)", "N/A"
+    except Exception as e:
+        return f"Error: {e}", "Error"
+
+def get_deep_stats(player_id):
+    """Fetches advanced stats (STL, BLK, FG%)"""
+    try:
+        url = f"https://{RAPID_HOST}/stats"
+        # Fetch last 10 games to ensure we catch recent activity
+        params = {
+            "seasons[]": "2024", # Try 2024 first (covers 24-25 season)
+            "player_ids[]": str(player_id),
+            "per_page": "10"
+        }
+        
+        resp = requests.get(url, headers=get_headers(), params=params, timeout=10)
+        
+        if resp.status_code == 401:
+            return "API Error 401: Invalid Key. Please check your RapidAPI key."
             
-        except Exception as e:
-            print(f"Attempt {attempt+1} failed: {e}")
-            time.sleep(2)
+        data = resp.json()['data']
+        
+        if not data:
+            # Fallback: Try 2025 if 2024 yields nothing
+            params["seasons[]"] = "2025"
+            resp = requests.get(url, headers=get_headers(), params=params, timeout=10)
+            data = resp.json()['data']
+            if not data: return "No stats found for current season."
+
+        games_log = []
+        for g in data:
+            date = g['game']['date'].split("T")[0]
             
-    return "Error: Could not find data on the web."
+            # Determine opponent
+            if g['game']['home_team']['id'] == g['team']['id']:
+                opp = f"vs {g['game']['visitor_team']['abbreviation']}"
+            else:
+                opp = f"@ {g['game']['home_team']['abbreviation']}"
+            
+            # Format Stats
+            fg = f"{g['fg_pct']*100:.1f}%" if g['fg_pct'] else "0%"
+            line = (f"PTS:{g['pts']} REB:{g['reb']} AST:{g['ast']} "
+                    f"STL:{g['stl']} BLK:{g['blk']} TO:{g['turnover']} FG:{fg}")
+            
+            games_log.append(f"[{date} {opp}] {line}")
+            
+        # Sort descending (newest first) and take top 5
+        games_log.sort(reverse=True)
+        return "\n".join(games_log[:5])
+        
+    except Exception as e:
+        return f"System Error: {e}"
 
 # --- MAIN APP ---
-if openai_key_input:
+if rapid_key_input and openai_key_input:
     
     llm_coach = ChatOpenAI(model="gpt-4o", temperature=0.5, api_key=openai_key_input)
 
     col1, col2 = st.columns(2)
-    with col1: p_name = st.text_input("Player Name", "Luka Doncic")
-    with col2: p_team = st.text_input("Team", "Dallas Mavericks")
-
+    with col1: p_name = st.text_input("Player Name", "Devin Booker")
+    
     if st.button("🚀 RUN ANALYSIS", type="primary"):
         
-        # PHASE 1: SCOUTING (Web Search)
-        with st.spinner("🕵️ Scanning the web for stats..."):
+        with st.spinner("Connecting to RapidAPI..."):
+            # 1. Get Player
+            pid, full_name, team_data = get_player_data(p_name)
+            if not pid:
+                st.error(f"Player '{p_name}' not found.")
+                st.stop()
             
-            # 1. Find Schedule
-            if manual_opponent:
-                opponent = manual_opponent
-                st.success(f"Opponent: {opponent} (Manual)")
-            else:
-                schedule_query = f"Who is the {p_team} playing next in November 2025? NBA schedule."
-                schedule_data = search_web(schedule_query)
+            team_name = team_data['full_name']
+            st.success(f"Found: {full_name} ({team_name})")
+            
+            # 2. Get Schedule
+            opponent, game_time = find_next_game(team_data['id'])
+            st.info(f"📅 NEXT GAME: {opponent} | ⏰ {game_time}")
+            
+            # 3. Get Deep Stats
+            stats_report = get_deep_stats(pid)
+            
+            if "Error" in stats_report:
+                st.error(stats_report)
+                st.stop()
                 
-                # Use GPT to extract the team name from the messy search results
-                opp_extractor = llm_coach.invoke(f"Extract ONLY the opponent team name from this text: {schedule_data}").content
-                opponent = opp_extractor.strip()
-                st.info(f"Next Game: {opponent}")
+            with st.expander("📊 Raw Deep Stats", expanded=True):
+                st.text(stats_report)
 
-            # 2. Find Player Stats (StatMuse usually ranks high)
-            stats_query = f"{p_name} last 5 games stats box score November 2025 StatMuse"
-            stats_data = search_web(stats_query)
-            
-            with st.expander("📊 Raw Search Data", expanded=True):
-                st.text(stats_data)
+        # 4. AI Prediction
+        with st.spinner("GPT-4o is generating the game plan..."):
+            try:
+                prompt = f"""
+                You are an Expert NBA Betting Analyst.
+                
+                TARGET: {full_name}
+                OPPONENT: {opponent}
+                
+                RECENT FORM (Last 5 Games):
+                {stats_report}
+                
+                TASK:
+                1. **Trend Analysis:** Is he hot or cold? (Look at FG% and PTS).
+                2. **Defensive Stocks:** Is he getting Steals/Blocks?
+                3. **Projection:** Predict his exact stat line (PTS/REB/AST) vs {opponent}.
+                4. **Betting Pick:** Recommend one specific prop bet (e.g. "Over 26.5 Points").
+                """
+                
+                prediction = llm_coach.invoke(prompt).content
+                st.divider()
+                st.markdown("### 🏆 Coach's Verdict")
+                st.write(prediction)
+                
+            except Exception as e:
+                st.error(f"AI Error: {e}")
 
-        # PHASE 2: COACHING
-        if "Error" not in stats_data:
-            with st.spinner("🧠 GPT-4o is analyzing..."):
-                try:
-                    prompt = f"""
-                    You are an Elite NBA Analyst.
-                    
-                    PLAYER: {p_name}
-                    OPPONENT: {opponent}
-                    
-                    WEB SEARCH RESULTS (Recent Games):
-                    {stats_data}
-                    
-                    TASK:
-                    1. **Recent Form:** Extract his Points/Rebounds/Assists from the search text. Is he hot?
-                    2. **Matchup:** How does he usually play against {opponent}?
-                    3. **Prediction:** Project his stat line for the next game.
-                    """
-                    
-                    prediction = llm_coach.invoke(prompt).content
-                    st.divider()
-                    st.markdown("### 🏆 Scouting Report")
-                    st.write(prediction)
-                    
-                except Exception as e:
-                    st.error(f"Coaching Error: {e}")
-        else:
-            st.error("Could not find stats. Try typing the opponent name manually.")
-
-elif not openai_key_input:
-    st.warning("⚠️ Please enter your OpenAI Key to start.")
+elif not rapid_key_input:
+    st.warning("⚠️ Please enter your RapidAPI Key to start.")
