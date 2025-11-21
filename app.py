@@ -8,26 +8,30 @@ from datetime import datetime, timedelta
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room (All-Star)", page_icon="⭐", layout="wide")
 st.title("🏀 NBA War Room (All-Star Edition)")
-st.markdown("**Tier:** All-Star (Official API) | **Features:** Injuries + Deep Stats + Persistent Chat")
+st.markdown("**Tier:** All-Star (Official API) | **Features:** Injuries + Deep Stats + Chat")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
     st.header("⚙️ Settings")
     bdl_key = st.text_input("BallDontLie API Key", type="password")
+    st.caption("Must be All-Star Tier or higher")
     openai_key = st.text_input("OpenAI API Key", type="password")
     
     if bdl_key: os.environ["BDL_API_KEY"] = bdl_key.strip()
     if openai_key: os.environ["OPENAI_API_KEY"] = openai_key.strip()
     
     st.divider()
-    st.info("Stats will stay visible while you chat.")
+    # Clear Button to reset the view
+    if st.button("New Search / Clear"):
+        st.session_state.analysis_data = None
+        st.session_state.messages = []
+        st.rerun()
 
-# --- INITIALIZE SESSION STATE ---
-# This creates the "Memory" for the app
+# --- SESSION STATE SETUP ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "analysis_data" not in st.session_state:
-    st.session_state.analysis_data = None # Stores the stats/report
+    st.session_state.analysis_data = None
 
 # --- API CONFIG ---
 BASE_URL = "https://api.balldontlie.io/v1"
@@ -38,7 +42,9 @@ def get_headers():
 # --- ALL-STAR TOOLS ---
 
 def get_team_injuries(team_id):
-    """Fetches official injury report with crash protection."""
+    """
+    [ALL-STAR EXCLUSIVE] Fetches official injury report with crash protection.
+    """
     try:
         url = f"{BASE_URL}/player_injuries"
         params = {"team_ids[]": str(team_id)}
@@ -51,19 +57,23 @@ def get_team_injuries(team_id):
         
         reports = []
         for i in data:
-            player = i.get('player', {}).get('first_name', '') + " " + i.get('player', {}).get('last_name', '')
+            # Safe extraction to prevent crashes
+            p_obj = i.get('player') or {}
+            p_name = f"{p_obj.get('first_name','')} {p_obj.get('last_name','')}"
             status = i.get('status', 'Unknown')
+            # Check multiple fields for the injury details
             note = i.get('note') or i.get('comment') or i.get('description') or "No details"
-            reports.append(f"- **{player}**: {status} ({note})")
+            reports.append(f"- **{p_name}**: {status} ({note})")
             
         return "\n".join(reports)
-    except Exception as e: return f"Error: {e}"
+    except Exception as e:
+        return f"Error fetching injuries: {e}"
 
 def get_player_info(name):
+    """Finds Player and their Team ID"""
     try:
         url = f"{BASE_URL}/players"
-        params = {"search": name, "per_page": "1"}
-        resp = requests.get(url, headers=get_headers(), params=params)
+        resp = requests.get(url, headers=get_headers(), params={"search": name, "per_page": 1})
         data = resp.json()['data']
         if not data: return None
         p = data[0]
@@ -75,31 +85,25 @@ def get_team_schedule_before_today(team_id):
     try:
         url = f"{BASE_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
-        params = {
-            "team_ids[]": str(team_id),
-            "seasons[]": "2025", 
-            "end_date": today,
-            "per_page": "20"
-        }
+        # We use '2025' for the 2025-26 season
+        params = {"team_ids[]": str(team_id), "seasons[]": "2025", "end_date": today, "per_page": "20"}
         resp = requests.get(url, headers=get_headers(), params=params)
         data = resp.json()['data']
-        finished_games = [g for g in data if g['status'] == "Final"]
-        finished_games.sort(key=lambda x: x['date'], reverse=True)
-        return finished_games[:5]
+        
+        # Filter for Final games only
+        finished = [g for g in data if g['status'] == "Final"]
+        # Sort newest first
+        finished.sort(key=lambda x: x['date'], reverse=True)
+        return finished[:5]
     except: return []
 
 def get_next_game(team_id):
+    """Finds the next scheduled game and opponent"""
     try:
         url = f"{BASE_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
         future = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
-        params = {
-            "team_ids[]": str(team_id),
-            "seasons[]": "2025",
-            "start_date": today,
-            "end_date": future,
-            "per_page": "5"
-        }
+        params = {"team_ids[]": str(team_id), "seasons[]": "2025", "start_date": today, "end_date": future, "per_page": "5"}
         resp = requests.get(url, headers=get_headers(), params=params)
         data = resp.json()['data']
         if not data: return None, "No games found.", None, None
@@ -107,26 +111,24 @@ def get_next_game(team_id):
         data.sort(key=lambda x: x['date'])
         game = data[0]
         
+        # Determine opponent
         if game['home_team']['id'] == team_id:
-            opp_team = game['visitor_team']
+            opp = game['visitor_team']
             loc = "vs"
         else:
-            opp_team = game['home_team']
+            opp = game['home_team']
             loc = "@"
             
-        date_str = game['date'].split("T")[0]
-        return f"{loc} {opp_team['full_name']}", date_str, opp_team['id'], opp_team['full_name']
-    except: return None, "Error.", None, None
+        return f"{loc} {opp['full_name']}", game['date'].split("T")[0], opp['id'], opp['full_name']
+    except: return None, "Error", None, None
 
 def get_stats_for_specific_games(player_id, game_ids):
+    """Fetches stats for specific Game IDs"""
     if not game_ids: return []
     try:
         url = f"{BASE_URL}/stats"
-        params = {
-            "player_ids[]": str(player_id),
-            "per_page": "10",
-            "game_ids[]": [str(g) for g in game_ids]
-        }
+        # We request specific game IDs to match the schedule
+        params = {"player_ids[]": str(player_id), "per_page": "10", "game_ids[]": [str(g) for g in game_ids]}
         resp = requests.get(url, headers=get_headers(), params=params)
         return resp.json()['data']
     except: return []
@@ -136,54 +138,152 @@ if bdl_key and openai_key:
     
     llm = ChatOpenAI(model="gpt-4o", temperature=0.5, api_key=openai_key)
     
-    col1, col2 = st.columns(2)
-    with col1: p_name = st.text_input("Player Name", "Luka Doncic")
-    
-    # --- BUTTON LOGIC (Saves to Session State) ---
-    if st.button("🚀 RUN ALL-STAR ANALYSIS", type="primary"):
-        with st.spinner("Fetching Official Data..."):
-            
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        p_name = st.text_input("Player Name", "Luka Doncic")
+    with col2:
+        st.write("") 
+        st.write("")
+        run_btn = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
+
+    # --- PROCESS DATA (On Click) ---
+    if run_btn:
+        status_box = st.status("🔍 Scouting in progress...", expanded=True)
+        
+        try:
             # 1. Player Info
+            status_box.write("Finding player...")
             res = get_player_info(p_name)
             if not res:
-                st.error("Player not found.")
+                status_box.update(label="Player not found!", state="error")
                 st.stop()
+            pid, fname, lname, tid, tname = res
             
-            pid, fname, lname, team_id, team_name = res
+            # 2. Schedule & Opponent
+            status_box.write("Checking schedule...")
+            opp_str, date, opp_id, opp_name = get_next_game(tid)
+            if not opp_str: opp_name = "Unknown"
             
-            # 2. Next Game & Opponent ID
-            opp_str, date_next, opp_id, opp_real_name = get_next_game(team_id)
-            if not opp_str: opp_real_name = "Unknown"
-
-            # 3. Injuries
-            injuries_home = get_team_injuries(team_id) if team_id else "N/A"
-            injuries_opp = get_team_injuries(opp_id) if opp_id else "N/A"
-
-            # 4. Stats
-            past_games = get_team_schedule_before_today(team_id)
-            game_ids = [g['id'] for g in past_games]
-            player_stats = get_stats_for_specific_games(pid, game_ids)
+            # 3. Injuries (Official API)
+            status_box.write("Fetching Official Injury Reports...")
+            inj_home = get_team_injuries(tid) if tid else "N/A"
+            inj_opp = get_team_injuries(opp_id) if opp_id else "N/A"
             
-            # Build Log
+            # 4. Deep Stats & DNPs
+            status_box.write("Crunching Deep Stats...")
+            past_games = get_team_schedule_before_today(tid)
+            gids = [g['id'] for g in past_games]
+            p_stats = get_stats_for_specific_games(pid, gids)
+            
             log_lines = []
-            for game in past_games:
-                gid = game['id']
-                date = game['date'].split("T")[0]
-                if game['home_team']['id'] == team_id:
-                    opp = game['visitor_team']['abbreviation']
-                    loc = "vs"
-                else:
-                    opp = game['home_team']['abbreviation']
-                    loc = "@"
+            for g in past_games:
+                gid = g['id']
+                d = g['date'].split("T")[0]
+                loc = "vs" if g['home_team']['id'] == tid else "@"
+                opp = g['visitor_team']['abbreviation'] if loc == "vs" else g['home_team']['abbreviation']
                 
-                stat = next((s for s in player_stats if s['game']['id'] == gid), None)
+                # Match Player Stat to Game
+                stat = next((s for s in p_stats if s['game']['id'] == gid), None)
+                
                 if stat and stat['min']:
-                    fg_pct = f"{stat['fg_pct']*100:.1f}%" if stat['fg_pct'] else "0%"
-                    line = f"MIN:{stat['min']} PTS:{stat['pts']} REB:{stat['reb']} AST:{stat['ast']} FG:{fg_pct}"
+                    # Deep Stats Formatting
+                    fg_pct = f"{stat['fg_pct']*100:.0f}%" if stat['fg_pct'] else "0%"
+                    fg3_str = f"{stat['fg3m']}/{stat['fg3a']}"
+                    min_ply = stat['min']
+                    
+                    line = (f"MIN:{min_ply} | PTS:{stat['pts']} REB:{stat['reb']} AST:{stat['ast']} | "
+                            f"FG:{fg_pct} 3PT:{fg3_str}")
                 else:
                     line = "❌ OUT (DNP)"
-                log_lines.append(f"[{date}] {loc} {opp} | {line}")
+                    
+                log_lines.append(f"[{d}] {loc} {opp} | {line}")
             
             final_log = "\n".join(log_lines)
             
-            # 5. Generate
+            # 5. GPT Analysis
+            status_box.write("Consulting GPT-4o...")
+            prompt = f"""
+            Role: NBA Expert.
+            Player: {fname} {lname} ({tname})
+            Matchup: {opp_str} ({date})
+            
+            OFFICIAL INJURY REPORT:
+            - {tname}: {inj_home}
+            - {opp_name}: {inj_opp}
+            
+            RECENT GAMES (2025 Season):
+            {final_log}
+            
+            Tasks:
+            1. **Health/Load:** Analyze minutes & DNPs. Is he fresh?
+            2. **Performance:** Check FG% and 3PT trend.
+            3. **Impact:** How do injuries (on both teams) affect him?
+            4. **Prediction:** Project PTS/REB/AST.
+            """
+            analysis = llm.invoke(prompt).content
+            
+            # 6. SAVE TO STATE & REFRESH
+            st.session_state.analysis_data = {
+                "player": f"{fname} {lname}",
+                "team": tname,
+                "matchup": opp_str,
+                "date": date,
+                "inj_home": inj_home,
+                "inj_opp": inj_opp,
+                "log": final_log,
+                "analysis": analysis,
+                "context": prompt + "\n\nPrediction:\n" + analysis
+            }
+            
+            # Initialize chat with the report
+            st.session_state.messages = [{"role": "assistant", "content": analysis}]
+            
+            status_box.update(label="Analysis Complete!", state="complete", expanded=False)
+            st.rerun() # Forces the UI to update immediately
+            
+        except Exception as e:
+            status_box.update(label="System Error", state="error")
+            st.error(f"Error details: {e}")
+
+    # --- DISPLAY RESULTS (Persistent) ---
+    data = st.session_state.analysis_data
+    
+    if data:
+        st.divider()
+        st.markdown(f"### 📊 Report: {data['player']} {data['matchup']}")
+        st.caption(f"Date: {data['date']}")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.info(f"**🏥 {data['team']} Injuries:**\n\n{data['inj_home']}")
+        with c2:
+            st.error(f"**🏥 Opponent Injuries:**\n\n{data['inj_opp']}")
+            
+        with st.expander("View Verified Game Log (Min/3PT/FG%)", expanded=True):
+            st.code(data['log'])
+            
+        st.write("### 🧠 Coach's Prediction")
+        st.write(data['analysis'])
+        
+        # --- CHAT SECTION ---
+        st.divider()
+        st.subheader("💬 Chat with the Scout")
+        
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                
+        if user_input := st.chat_input("Ask follow-up (e.g. 'How are his 3s?'):"):
+            with st.chat_message("user"):
+                st.markdown(user_input)
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    full_context = f"CONTEXT:\n{data['context']}\n\nUSER ASKED: {user_input}"
+                    response = llm.invoke(full_context).content
+                    st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
+
+elif not bdl_key:
+    st.warning("⚠️ Please enter API Keys.")
