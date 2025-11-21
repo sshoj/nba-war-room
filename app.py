@@ -1,31 +1,36 @@
-import streamlit as st
-import requests
-import json
+import pandas as pd
+from nba_api.stats.endpoints import teaminfocommon
 
-st.title("🔌 'NBA API Free Data' Connection Test")
-
-# 1. YOUR SPECIFIC CONFIGURATION
-url = "https://nba-api-free-data.p.rapidapi.com/nba-atlantic-team-list"
-headers = {
-    "x-rapidapi-host": "nba-api-free-data.p.rapidapi.com",
-    # ⚠️ REPLACE THIS WITH YOUR NEW KEY AFTER ROTATING IT
-    "x-rapidapi-key": st.secrets.get("RAPID_KEY", "PASTE_YOUR_KEY_HERE")
+# 1. Setup Headers (CRITICAL: Prevents "Connection Timed Out" or 403 Errors)
+custom_headers = {
+    'Host': 'stats.nba.com',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
+    'Accept': 'application/json, text/plain, */*',
+    'Referer': 'https://stats.nba.com/',
+    'Connection': 'keep-alive',
 }
 
-if st.button("Test Connection"):
-    try:
-        st.write(f"Connecting to: `{url}`...")
-        response = requests.get(url, headers=headers)
-        
-        if response.status_code == 200:
-            st.success("✅ Connection Successful!")
-            data = response.json()
-            st.write("### Response Data:")
-            st.json(data)
-        elif response.status_code == 403:
-            st.error("❌ 403 Forbidden: You might need to Subscribe to the API plan on RapidAPI.")
-        else:
-            st.error(f"❌ Error {response.status_code}: {response.text}")
-            
-    except Exception as e:
-        st.error(f"System Error: {e}")
+# 2. Define the Team ID (1610612742 is correct for Dallas Mavericks)
+mavs_id = 1610612742
+
+try:
+    print(f"🏀 Fetching info for Team ID: {mavs_id}...")
+    
+    # 3. Call the Endpoint with Headers
+    # Note: We pass 'headers=custom_headers' to bypass the block
+    mavs_info = teaminfocommon.TeamInfoCommon(
+        team_id=mavs_id, 
+        headers=custom_headers,
+        timeout=10
+    )
+    
+    # 4. Get the DataFrame
+    # The endpoint returns a list of DataFrames. We want the first one (Index 0).
+    df = mavs_info.get_data_frames()[0]
+    
+    # 5. Display Result
+    print("✅ Success! Data Retrieved:")
+    print(df[['TEAM_NAME', 'TEAM_CITY', 'W', 'L', 'PCT']].to_string(index=False))
+
+except Exception as e:
+    print(f"❌ Error: {e}")
