@@ -40,45 +40,53 @@ def get_player_data(player_name):
         return (data[0]['id'], data[0]['first_name'] + " " + data[0]['last_name'], data[0]['team']) if data else (None, None, None)
     except: return None, None, None
 def get_advanced_stats(player_id):
-    """Fetches detailed stats with strict type handling"""
+    """Fetches detailed stats with Crash Protection"""
     try:
         url = f"{BASE_URL}/stats"
-        # FIX: Explicitly cast integers to strings/lists to satisfy strict APIs
+        # Requesting both seasons to ensure we catch the crossover
         params = {
-            "seasons[]": ["2024", "2025"], # Check both seasons to be safe
+            "seasons[]": ["2024", "2025"], 
             "player_ids[]": [str(player_id)], 
             "per_page": "10"
         }
         
-        # 1. Make Request
-        resp = requests.get(url, headers=get_headers(), params=params)
+        resp = requests.get(url, headers=get_headers(), params=params, timeout=10)
         
-        # 2. Debugging Block (If it fails again, we will see WHY)
         if resp.status_code != 200:
-            return f"API Error {resp.status_code}: {resp.text}"
+            return f"API Error {resp.status_code}"
             
         data = resp.json()['data']
-        
         if not data: return "No games found for 2024-25 season."
         
         games_log = []
         for g in data:
-            date = g['game']['date'].split("T")[0]
+            # 1. Safe Date Parse
+            game_info = g.get('game', {})
+            date = game_info.get('date', 'Unknown').split("T")[0]
             
-            # Determine opponent (Handle Home/Away)
-            if g['game']['home_team']['id'] == g['team']['id']:
-                opp = g['game']['visitor_team']['abbreviation']
-                loc = "vs"
+            # 2. Safe Opponent Parse (The Fix)
+            # We use .get() to avoid the 'home_team' Key Error
+            home_team = game_info.get('home_team')
+            visitor_team = game_info.get('visitor_team')
+            player_team_id = g.get('team', {}).get('id')
+
+            if home_team and visitor_team and player_team_id:
+                if home_team['id'] == player_team_id:
+                    opp = visitor_team.get('abbreviation', 'UNK')
+                    loc = "vs"
+                else:
+                    opp = home_team.get('abbreviation', 'UNK')
+                    loc = "@"
             else:
-                opp = g['game']['home_team']['abbreviation']
-                loc = "@"
+                # Fallback if API data is incomplete
+                opp = "OPP"
+                loc = "-"
+
+            # 3. Safe Stats Parse
+            fg_pct = f"{g.get('fg_pct', 0) * 100:.1f}%" if g.get('fg_pct') else "0.0%"
             
-            # Safe Percentage Handling
-            fg_pct = f"{g['fg_pct'] * 100:.1f}%" if g['fg_pct'] else "0.0%"
-            
-            # The Deep Stat Line
-            stat_line = (f"PTS:{g['pts']} REB:{g['reb']} AST:{g['ast']} "
-                         f"STL:{g['stl']} BLK:{g['blk']} TO:{g['turnover']} "
+            stat_line = (f"PTS:{g.get('pts', 0)} REB:{g.get('reb', 0)} AST:{g.get('ast', 0)} "
+                         f"STL:{g.get('stl', 0)} BLK:{g.get('blk', 0)} TO:{g.get('turnover', 0)} "
                          f"FG:{fg_pct}")
             
             games_log.append(f"[{date} {loc} {opp}] {stat_line}")
