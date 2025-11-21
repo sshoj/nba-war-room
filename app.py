@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room (Official)", page_icon="🏀", layout="wide")
 st.title("🏀 NBA War Room (Official API)")
-st.markdown("**Source:** api.balldontlie.io | **Coach:** GPT-4o")
+st.markdown("**Source:** api.balldontlie.io (Direct) | **Season:** 2025-26 | **Coach:** GPT-4o")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
@@ -45,7 +45,6 @@ def get_next_game(team_id):
     try:
         url = f"{BASE_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
-        # Look ahead 14 days to be safe
         future = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
         
         params = {
@@ -59,13 +58,11 @@ def get_next_game(team_id):
         
         if not data: return None, "No upcoming games found."
         
-        # Sort by Date Ascending (Soonest first)
         data.sort(key=lambda x: x['date'])
-        
-        # Pick the first one
         game = data[0]
+        
         date_str = game['date'].split("T")[0]
-        time_str = game['status'] # e.g., "8:00 PM ET"
+        time_str = game['status'] 
         
         if game['home_team']['id'] == team_id:
             return f"vs {game['visitor_team']['full_name']}", f"{date_str} @ {time_str}"
@@ -74,38 +71,34 @@ def get_next_game(team_id):
             
     except Exception as e: return None, str(e)
 
-def get_previous_games(team_id):
-    """Fetches the 5 most recent FINAL games before today"""
+def get_team_schedule(team_id):
+    """Fetches the TEAM'S last 5 finished games for 2025-2026 ONLY"""
     try:
         url = f"{BASE_URL}/games"
-        # Look back at the whole 2024-2025 season
+        # STRICT FILTER: Only Season 2025 (Start year for 25-26 season)
         params = {
             "team_ids[]": str(team_id),
-            "seasons[]": "2024", 
-            "per_page": "100" # Get enough to sort
+            "seasons[]": "2025", 
+            "per_page": "10"
         }
         resp = requests.get(url, headers=get_headers(), params=params)
         data = resp.json()['data']
         
-        # Filter: Must be "Final" AND date must be before today
-        # (Although 'Final' usually implies past, we sort to be sure)
         finished_games = [g for g in data if g['status'] == "Final"]
-        
-        # Sort Descending (Newest First)
         finished_games.sort(key=lambda x: x['date'], reverse=True)
         
-        return finished_games[:5] # Return top 5
+        return finished_games[:5]
     except: return []
 
-def get_stats_for_games(player_id, game_ids):
-    """Get stats for specific game IDs"""
+def get_game_stats(player_id, game_ids):
+    """Fetches stats including FG% for specific games"""
     if not game_ids: return []
     try:
         url = f"{BASE_URL}/stats"
         params = {
             "player_ids[]": str(player_id),
             "per_page": "10",
-            "game_ids[]": game_ids
+            "game_ids[]": [str(gid) for gid in game_ids]
         }
         resp = requests.get(url, headers=get_headers(), params=params)
         return resp.json()['data']
@@ -119,9 +112,8 @@ if bdl_key and openai_key:
     col1, col2 = st.columns(2)
     with col1: p_name = st.text_input("Player Name", "Luka Doncic")
     
-    # DISPLAY TODAY'S DATE
     today_display = datetime.now().strftime("%A, %B %d, %Y")
-    st.caption(f"📅 Today's Date: **{today_display}**")
+    st.caption(f"📅 Today: **{today_display}**")
     
     if st.button("🚀 RUN ANALYSIS", type="primary"):
         with st.spinner("Accessing War Room Data..."):
@@ -142,33 +134,35 @@ if bdl_key and openai_key:
             else:
                 st.warning("No upcoming games found.")
                 
-            # 3. Previous 5 Games
-            past_games = get_previous_games(team_id)
+            # 3. Previous 5 Games (2025 Season Only)
+            past_games = get_team_schedule(team_id)
             if not past_games:
-                st.error("No past games found.")
+                st.error("No past games found for 2025-26 season.")
                 st.stop()
                 
-            # 4. Get Stats for those games
+            # 4. Get Stats
             gids = [g['id'] for g in past_games]
-            stats_data = get_stats_for_games(pid, gids)
+            stats_data = get_game_stats(pid, gids)
             
-            # 5. Format Log
+            # 5. Format Log with FG%
             log_lines = []
             for game in past_games:
                 gid = game['id']
                 date = game['date'].split("T")[0]
                 
-                # Determine Opponent
                 if game['home_team']['id'] == team_id:
                     opp = f"vs {game['visitor_team']['abbreviation']}"
                 else:
                     opp = f"@ {game['home_team']['abbreviation']}"
                 
-                # Find Stat Line
                 stat = next((s for s in stats_data if s['game']['id'] == gid), None)
                 
                 if stat and stat['min']:
-                    line = f"PTS:{stat['pts']} REB:{stat['reb']} AST:{stat['ast']} (FG: {stat['fg_pct']:.0%})"
+                    # NEW: Extract FG%
+                    fg_pct = stat.get('fg_pct', 0) or 0 # Handle None
+                    fg_display = f"{fg_pct*100:.1f}%"
+                    
+                    line = f"PTS:{stat['pts']} REB:{stat['reb']} AST:{stat['ast']} FG%:{fg_display}"
                 else:
                     line = "❌ OUT (DNP)"
                     
@@ -176,23 +170,22 @@ if bdl_key and openai_key:
                 
             final_log = "\n".join(log_lines)
             
-            with st.expander("📊 Last 5 Games (Before Today)", expanded=True):
+            with st.expander("📊 Last 5 Games (Season 2025-26)", expanded=True):
                 st.code(final_log)
                 
             # 6. GPT Analysis
             prompt = f"""
             Analyze NBA Player: {fname} {lname}
-            TODAY'S DATE: {today_display}
-            
+            TODAY: {today_display}
             NEXT MATCHUP: {opp_name}
             
-            LAST 5 GAMES (Most Recent First):
+            GAME LOG (2025-26 Season):
             {final_log}
             
             TASK:
-            1. Is he trending UP or DOWN?
-            2. Did he play the last game?
-            3. Predict stats for the game against {opp_name}.
+            1. Trend: Is his scoring efficient (High FG%)?
+            2. Status: Is he playing consistently?
+            3. Predict his stat line vs {opp_name}.
             """
             
             response = llm.invoke(prompt).content
