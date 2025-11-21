@@ -12,16 +12,19 @@ import os
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room (Hybrid)", page_icon="🏀")
 st.title("🏀 Hybrid AI War Room")
-st.markdown("**Scout:** Gemini (Free/REST) | **Coach:** GPT-4o (Paid)")
+st.markdown("**Scout:** Gemini 1.5 Flash (Free/Fast) | **Coach:** GPT-4o (Paid)")
 
 # --- SIDEBAR: DUAL KEYS ---
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    google_key = st.text_input("Google Gemini Key", type="password")
+    # We add .strip() here to remove accidental spaces
+    google_key_input = st.text_input("Google Gemini Key", type="password")
+    google_key = google_key_input.strip() if google_key_input else None
     st.markdown("[Get Free Google Key](https://aistudio.google.com/app/apikey)")
     
-    openai_key = st.text_input("OpenAI API Key", type="password")
+    openai_key_input = st.text_input("OpenAI API Key", type="password")
+    openai_key = openai_key_input.strip() if openai_key_input else None
     st.markdown("[Get OpenAI Key](https://platform.openai.com/account/api-keys)")
     
     if google_key: os.environ["GOOGLE_API_KEY"] = google_key
@@ -55,10 +58,11 @@ search = DuckDuckGoSearchRun()
 
 # --- MAIN APP LOGIC ---
 if google_key and openai_key:
-    # 1. THE SCOUT (Gemini)
-    # FIX: We added transport="rest" to stop the Event Loop crash
+    # 1. THE SCOUT (Gemini 1.5 Flash)
+    # We use 'gemini-1.5-flash' which is the most stable free model right now.
+    # We use transport="rest" to stop the Streamlit crash.
     llm_scout = ChatGoogleGenerativeAI(
-        model="gemini-1.5-pro", 
+        model="gemini-1.5-flash", 
         temperature=0, 
         google_api_key=google_key,
         transport="rest"
@@ -89,7 +93,7 @@ if google_key and openai_key:
     if st.button("🚀 RUN HYBRID ANALYSIS", type="primary"):
         
         scouting_report = ""
-        with st.spinner("Step 1: Gemini is scouting the data..."):
+        with st.spinner("Step 1: Gemini (Scout) is gathering data..."):
             try:
                 opp_query = f"Who is {p_team} playing next? Return ONLY team name."
                 opponent = scout_agent.invoke({"input": opp_query})['output']
@@ -113,7 +117,7 @@ if google_key and openai_key:
                 st.stop()
 
         if scouting_report:
-            with st.spinner("Step 2: GPT-4o is making the game plan..."):
+            with st.spinner("Step 2: GPT-4o (Coach) is making the game plan..."):
                 try:
                     coach_prompt = f"""
                     You are an expert NBA Head Coach. Read this scouting report and make a final game prediction.
