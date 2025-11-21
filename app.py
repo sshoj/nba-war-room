@@ -120,4 +120,82 @@ if bdl_key and openai_key:
             
             # 1. Get Player & Team
             res = get_player_info(p_name)
+            
+            # FIX: Proper indentation for the error check
             if not res or not res[0]:
+                st.error("Player not found.")
+                st.stop()
+                
+            pid, fname, lname, team_id = res
+            st.success(f"Found: {fname} {lname}")
+            
+            # 2. Get Team's Last 5 Games
+            team_games = get_team_schedule(team_id)
+            if not team_games:
+                st.error("No recent games found.")
+                st.stop()
+                
+            # 3. Get Stats for those games
+            game_ids = [g['id'] for g in team_games]
+            player_stats = get_game_stats(pid, game_ids)
+            
+            # 4. Get Standings
+            rank_map = get_conference_rankings()
+            
+            # 5. MERGE DATA (Detect DNPs)
+            report_lines = []
+            
+            for game in team_games:
+                date = game['date'].split("T")[0]
+                gid = game['id']
+                
+                # Identify Opponent
+                if game['home_team']['id'] == team_id:
+                    opp_team = game['visitor_team']
+                    loc = "vs"
+                else:
+                    opp_team = game['home_team']
+                    loc = "@"
+                
+                opp_name = opp_team['abbreviation']
+                opp_rank = rank_map.get(opp_team['id'], "")
+                
+                # Check if Player Played
+                stat_entry = next((s for s in player_stats if s['game']['id'] == gid), None)
+                
+                if stat_entry and stat_entry['min']: 
+                    pts = stat_entry['pts']
+                    reb = stat_entry['reb']
+                    ast = stat_entry['ast']
+                    status = f"PTS:{pts} REB:{reb} AST:{ast}"
+                else:
+                    status = "❌ OUT (DNP)"
+                
+                line = f"[{date}] {loc} {opp_name} {opp_rank} | {status}"
+                report_lines.append(line)
+            
+            final_report = "\n".join(report_lines)
+            
+            with st.expander("📊 Official Game Log", expanded=True):
+                st.code(final_report)
+                
+            # 6. GPT Analysis
+            prompt = f"""
+            Analyze this NBA player's recent form.
+            PLAYER: {fname} {lname}
+            
+            GAME LOG (Last 5 Team Games):
+            {final_report}
+            
+            TASK:
+            1. Identify if he is missing games (Injury risk?).
+            2. If playing, is he consistent?
+            3. Note the quality of opponents faced.
+            """
+            
+            response = llm.invoke(prompt).content
+            st.write("### 🧠 Analyst Notes")
+            st.write(response)
+
+elif not bdl_key:
+    st.warning("⚠️ Enter your Official BallDontLie API Key.")
