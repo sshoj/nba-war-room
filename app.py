@@ -1,9 +1,10 @@
+import streamlit as st
 import pandas as pd
-import time
 from nba_api.stats.endpoints import teaminfocommon
 
-# 1. Setup Headers (CRITICAL)
-# Without these, NBA.com will see you as a bot and block the connection.
+st.title("🏀 NBA API Connection Test")
+
+# 1. Setup Anti-Blocking Headers
 custom_headers = {
     'Host': 'stats.nba.com',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
@@ -12,33 +13,31 @@ custom_headers = {
     'Connection': 'keep-alive',
 }
 
-# 2. Define Team ID (1610612742 = Dallas Mavericks)
+# 2. Dallas Mavericks ID
 mavs_id = 1610612742
 
-print(f"📡 Pinging NBA API for Team ID: {mavs_id}...")
-start_time = time.time()
-
-try:
-    # 3. Call the Endpoint with Headers
-    # We pass 'headers=custom_headers' to bypass the block
-    # We set a timeout so it doesn't freeze forever if blocked
-    dallas = teaminfocommon.TeamInfoCommon(
-        team_id=mavs_id, 
-        headers=custom_headers,
-        timeout=10
-    )
-    
-    # 4. Get the DataFrame
-    # Your syntax was correct! .team_info_common.get_data_frame() works.
-    df = dallas.team_info_common.get_data_frame()
-    
-    end_time = time.time()
-    ping_ms = (end_time - start_time) * 1000
-
-    # 5. Show Results
-    print(f"✅ Success! Ping: {ping_ms:.2f}ms")
-    print("--- Connection Result ---")
-    print(df[['TEAM_NAME', 'TEAM_CITY', 'W', 'L', 'PCT']].to_string(index=False))
-
-except Exception as e:
-    print(f"❌ Connection Failed: {e}")
+if st.button("Run Connection Test"):
+    with st.spinner("Pinging NBA.com (Max 10 seconds)..."):
+        try:
+            # 3. Call API with Timeout
+            mavs_info = teaminfocommon.TeamInfoCommon(
+                team_id=mavs_id, 
+                headers=custom_headers,
+                timeout=10  # <--- CRITICAL: Prevents infinite hanging
+            )
+            
+            # 4. Get Data
+            df = mavs_info.get_data_frames()[0]
+            
+            # 5. Show Success
+            st.success("✅ Connection Successful!")
+            st.write("### Data Received:")
+            st.dataframe(df) # Shows the interactive table
+            
+        except Exception as e:
+            st.error("❌ Connection Failed")
+            st.warning(f"Error Details: {e}")
+            
+            # Context for the user
+            if "Read timed out" in str(e) or "403" in str(e):
+                st.info("💡 NOTE: This error confirms that NBA.com is blocking Streamlit Cloud's IP address. You should stick to the RapidAPI or Web-Search method.")
