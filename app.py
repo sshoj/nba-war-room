@@ -249,14 +249,21 @@ def get_betting_odds(player_name, team_name):
         return "Odds API Key missing."
 
     try:
-        # 1. Get Games list
+        # 1. Get Games list (events) – NOTE: /events only needs apiKey
         games_resp = requests.get(
             f"{ODDS_URL}/events",
-            params={"apiKey": api_key, "regions": "us"},
+            params={"apiKey": api_key},
             timeout=REQUEST_TIMEOUT,
         )
+
         if games_resp.status_code != 200:
-            return f"Error fetching games from Odds API (status {games_resp.status_code})."
+            # Show response text too, so you see WHY it's 401
+            try:
+                msg = games_resp.json().get("message", games_resp.text)
+            except Exception:
+                msg = games_resp.text
+            return f"Error fetching games from Odds API (status {games_resp.status_code}): {msg}"
+
         games = games_resp.json()
 
         if not isinstance(games, list) or not games:
@@ -279,7 +286,8 @@ def get_betting_odds(player_name, team_name):
         if not game_id:
             return f"No active betting lines found for {team_name}."
 
-        # 2. Try Player Props First
+        # 2. Try Player Props First ...
+        # (keep the rest of your function the same)
         props_resp = requests.get(
             f"{ODDS_URL}/events/{game_id}/odds",
             params={
