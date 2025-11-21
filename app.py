@@ -31,7 +31,7 @@ def get_headers():
 def get_team_injuries(team_id):
     """
     [ALL-STAR TIER EXCLUSIVE]
-    Fetches official injury report for a specific team.
+    Fetches official injury report with crash protection.
     """
     try:
         url = f"{BASE_URL}/player_injuries"
@@ -39,20 +39,34 @@ def get_team_injuries(team_id):
             "team_ids[]": str(team_id)
         }
         resp = requests.get(url, headers=get_headers(), params=params)
-        data = resp.json()['data']
+        
+        # Handle non-200 responses
+        if resp.status_code != 200:
+            return f"API Error {resp.status_code}"
+            
+        data = resp.json().get('data', [])
         
         if not data: return "No active injuries reported."
         
         reports = []
         for i in data:
-            player = f"{i['player']['first_name']} {i['player']['last_name']}"
-            status = i['status'] # e.g., "Out", "Day-To-Day"
-            note = i['note'] # e.g., "Sprained Ankle"
+            # 1. Safe Player Name Extraction
+            player_data = i.get('player', {})
+            player = f"{player_data.get('first_name', 'Unknown')} {player_data.get('last_name', '')}"
+            
+            # 2. Safe Status & Note Extraction (The Fix)
+            # We use .get() so it never crashes if a field is missing
+            status = i.get('status', 'Status Unknown')
+            
+            # Try multiple common keys for description just in case
+            note = i.get('note') or i.get('comment') or i.get('description') or "No details"
+            
             reports.append(f"- **{player}**: {status} ({note})")
             
         return "\n".join(reports)
+        
     except Exception as e:
-        return f"Error fetching injuries: {e}"
+        return f"System Error fetching injuries: {e}"
 
 def get_player_info(name):
     try:
