@@ -2,23 +2,18 @@ import streamlit as st
 import requests
 from langchain_openai import ChatOpenAI
 import os
+import pandas as pd
 from datetime import datetime, timedelta
 import difflib 
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room (Ultimate)", page_icon="🏀", layout="wide")
 st.title("🏀 NBA War Room (Ultimate Edition)")
-st.markdown("**Stats:** BallDontLie | **Odds:** FanDuel | **Coach:** GPT-4o")
+st.markdown("**Stats:** BallDontLie | **Odds:** FanDuel (Props or Moneyline) | **Coach:** GPT-4o")
 
 # --- SECURE AUTHENTICATION ---
 def load_keys():
-    """
-    Loads API keys from st.secrets if available, otherwise asks user in sidebar.
-    Returns a dictionary of keys.
-    """
     keys = {}
-    
-    # Helper to get key from secrets or sidebar
     def get_key(secret_name, label):
         if secret_name in st.secrets:
             st.sidebar.success(f"✅ {label} Key Loaded")
@@ -30,7 +25,6 @@ def load_keys():
     keys["odds"] = get_key("ODDS_API_KEY", "The Odds API")
     keys["openai"] = get_key("OPENAI_API_KEY", "OpenAI")
     
-    # Set Environment Variables for global access
     if keys["bdl"]: os.environ["BDL_API_KEY"] = keys["bdl"].strip()
     if keys["odds"]: os.environ["ODDS_API_KEY"] = keys["odds"].strip()
     if keys["openai"]: os.environ["OPENAI_API_KEY"] = keys["openai"].strip()
@@ -66,11 +60,8 @@ def get_bdl_headers():
 def get_player_info_smart(user_input):
     """Smart Search V2: Handles typos (Trigram method)"""
     try:
-        # 1. Split input into words
         words = user_input.split()
         candidates = {} 
-        
-        # 2. Broad Search
         search_terms = set(words)
         for w in words:
             if len(w) >= 3: search_terms.add(w[:3])
@@ -83,7 +74,6 @@ def get_player_info_smart(user_input):
         
         if not candidates: return None, f"Player '{user_input}' not found."
         
-        # 3. Fuzzy Match
         candidate_list = list(candidates.values())
         candidate_names = [f"{c['first_name']} {c['last_name']}" for c in candidate_list]
         best_matches = difflib.get_close_matches(user_input, candidate_names, n=1, cutoff=0.4)
@@ -98,7 +88,7 @@ def get_player_info_smart(user_input):
     except Exception as e: return None, f"Search Error: {e}"
 
 def get_team_injuries(team_id):
-    """Fetches official injury report with crash protection."""
+    """Fetches official injury report"""
     try:
         url = f"{BDL_URL}/player_injuries"
         resp = requests.get(url, headers=get_bdl_headers(), params={"team_ids[]": str(team_id)})
@@ -116,29 +106,30 @@ def get_team_injuries(team_id):
     except: return "Error fetching injuries."
 
 def get_team_schedule_before_today(team_id):
-    """Fetches TEAM'S last 5 finished games"""
+    """Fetches TEAM'S last 7 finished games (EXTENDED HISTORY)"""
     try:
         url = f"{BDL_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
-        params = {"team_ids[]": str(team_id), "seasons[]": "2025", "end_date": today, "per_page": "20"}
+        # Fetch more games to ensure we have enough 'Final' ones
+        params = {"team_ids[]": str(team_id), "seasons[]": "2025", "end_date": today, "per_page": "25"}
         resp = requests.get(url, headers=get_bdl_headers(), params=params)
         data = resp.json().get('data', [])
         finished = [g for g in data if g.get('status') == "Final"]
         finished.sort(key=lambda x: x['date'], reverse=True)
-        return finished[:5]
+        # UPDATED: Return 7 games instead of 5
+        return finished[:7]
     except: return []
 
 def get_stats_for_games(player_id, game_ids):
     if not game_ids: return []
     try:
         url = f"{BDL_URL}/stats"
-        params = {"player_ids[]": str(player_id), "per_page": "10", "game_ids[]": [str(g) for g in game_ids]}
+        params = {"player_ids[]": str(player_id), "per_page": "15", "game_ids[]": [str(g) for g in game_ids]}
         resp = requests.get(url, headers=get_bdl_headers(), params=params)
         return resp.json().get('data', [])
     except: return []
 
 def get_next_game(team_id):
-    """Finds next scheduled game"""
     try:
         url = f"{BDL_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
@@ -161,28 +152,35 @@ def get_next_game(team_id):
         return f"{loc} {opp.get('full_name', 'Unknown')}", game['date'].split("T")[0], opp.get('id'), opp.get('full_name')
     except: return None, "Error", None, None
 
-def get_fanduel_props(player_name, team_name):
-    """Fetches FanDuel Player Props via The Odds API"""
+def get_betting_odds(player_name, team_name):
+    """
+    Fetches Betting Lines.
+    STRATEGY:
+    1. Try Player Props (Points, etc.) first.
+    2. If no props found, FALLBACK to Game Moneyline (H2H).
+    """
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key: return "Odds API Key missing."
 
     try:
-        # 1. Get Today's Games
+        # 1. Get Games
         games_resp = requests.get(f"{ODDS_URL}/events", params={"apiKey": api_key, "regions": "us"})
         games = games_resp.json()
         
         if not games or isinstance(games, dict) and "message" in games: 
-            return "No betting lines available right now."
+            return "No betting lines available."
 
         game_id = None
         for g in games:
             if team_name in g['home_team'] or team_name in g['away_team']:
                 game_id = g['id']
+                home_team = g['home_team']
+                away_team = g['away_team']
                 break
         
         if not game_id: return f"No active betting lines found for {team_name}."
 
-        # 2. Fetch Props
+        # 2. Try Player Props First
         props_resp = requests.get(
             f"{ODDS_URL}/events/{game_id}/odds",
             params={
@@ -193,25 +191,45 @@ def get_fanduel_props(player_name, team_name):
             }
         )
         data = props_resp.json()
+        bookmakers = data.get('bookmakers', [])
         
         lines = []
-        bookmakers = data.get('bookmakers', [])
-        if not bookmakers: return "No FanDuel lines released yet."
+        if bookmakers:
+            for market in bookmakers[0].get('markets', []):
+                market_name = market['key'].replace("player_", "").title()
+                for outcome in market['outcomes']:
+                    p_last = player_name.split()[-1]
+                    if p_last in outcome['description']:
+                        line = outcome.get('point', 'N/A')
+                        price = outcome.get('price', 'N/A')
+                        lines.append(f"**{market_name}**: {line} ({price})")
         
-        for market in bookmakers[0].get('markets', []):
-            market_name = market['key'].replace("player_", "").title()
-            for outcome in market['outcomes']:
-                p_last = player_name.split()[-1]
-                if p_last in outcome['description']:
-                    line = outcome.get('point', 'N/A')
-                    price = outcome.get('price', 'N/A')
-                    lines.append(f"**{market_name}**: {line} ({price})")
+        if lines:
+            return " | ".join(lines)
+            
+        # 3. Fallback to Moneyline (H2H) if no props found
+        h2h_resp = requests.get(
+            f"{ODDS_URL}/events/{game_id}/odds",
+            params={
+                "apiKey": api_key,
+                "regions": "us",
+                "markets": "h2h",
+                "bookmakers": "fanduel"
+            }
+        )
+        h2h_data = h2h_resp.json()
+        bm_h2h = h2h_data.get('bookmakers', [])
         
-        return " | ".join(lines) if lines else f"No specific props found for {player_name}."
+        if bm_h2h:
+            outcomes = bm_h2h[0]['markets'][0]['outcomes']
+            odds_str = " vs ".join([f"{o['name']} ({o['price']})" for o in outcomes])
+            return f"Props not ready. **Game Odds:** {odds_str}"
+            
+        return "No odds available."
 
     except Exception as e: return f"Error fetching odds: {e}"
 
-# --- MAIN APP LOGIC ---
+# --- MAIN LOGIC ---
 if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
     
     llm = ChatOpenAI(model="gpt-4o", temperature=0.5, api_key=api_keys["openai"])
@@ -220,11 +238,11 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
     with col1:
         p_name = st.text_input("Player Name", "Luka Doncic")
     with col2:
-        st.write("")
+        st.write("") 
         st.write("")
         run_btn = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
 
-    # --- PROCESS DATA (On Click) ---
+    # --- PROCESS DATA ---
     if run_btn:
         status_box = st.status("🔍 Scouting in progress...", expanded=True)
         
@@ -249,16 +267,16 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             opp_str, date, opp_id, opp_name = get_next_game(tid)
             if not opp_str: opp_name = "Unknown"
 
-            # 3. Betting Odds
-            status_box.write("Fetching FanDuel Lines...")
-            betting_lines = get_fanduel_props(f"{fname} {lname}", tname)
+            # 3. Betting Odds (With Fallback)
+            status_box.write("Checking Lines...")
+            betting_lines = get_betting_odds(f"{fname} {lname}", tname)
 
             # 4. Injuries
-            status_box.write("Checking injuries...")
+            status_box.write("Fetching Injuries...")
             inj_home = get_team_injuries(tid) if tid else "N/A"
             inj_opp = get_team_injuries(opp_id) if opp_id else "N/A"
 
-            # 5. Stats (Team Schedule First)
+            # 5. Stats (7 Games + Strict DNP)
             status_box.write("Crunching stats...")
             past_games = get_team_schedule_before_today(tid)
             gids = [g['id'] for g in past_games]
@@ -269,28 +287,32 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                 gid = g['id']
                 d = g['date'].split("T")[0]
                 
-                # Opponent & Location
-                if g['home_team']['id'] == tid:
-                    opp_abbr = g['visitor_team']['abbreviation']
+                home = g.get('home_team', {})
+                visitor = g.get('visitor_team', {})
+                
+                if home.get('id') == tid:
+                    opp_abbr = visitor.get('abbreviation', 'UNK')
                     loc = "vs"
                 else:
-                    opp_abbr = g['home_team']['abbreviation']
+                    opp_abbr = home.get('abbreviation', 'UNK')
                     loc = "@"
                 
-                # Find Stat Line
                 stat = next((s for s in p_stats if s['game']['id'] == gid), None)
                 
-                if stat and stat.get('min') and stat['min'] != "00:00" and stat['min'] != "0":
+                # STRICT DNP CHECK
+                # Check for None, "0", "00:00", or 0 integer
+                min_val = stat.get('min') if stat else None
+                if min_val and str(min_val) != "0" and str(min_val) != "00:00" and str(min_val) != "":
                     fg = f"{stat['fg_pct']*100:.0f}%" if stat.get('fg_pct') else "0%"
-                    fg3 = f"{stat.get('fg3m',0)}/{stat.get('fg3a',0)}"
-                    line = f"MIN:{stat.get('min')} | PTS:{stat.get('pts')} REB:{stat.get('reb')} AST:{stat.get('ast')} | FG:{fg} 3PT:{fg3}"
+                    fg3 = f"{stat.get('fg3m', 0)}/{stat.get('fg3a', 0)}"
+                    line = f"MIN:{min_val} | PTS:{stat.get('pts',0)} REB:{stat.get('reb',0)} AST:{stat.get('ast',0)} | FG:{fg} 3PT:{fg3}"
                 else:
                     line = "⛔ DNP (Did Not Play)"
                     
                 log_lines.append(f"[{d}] {loc} {opp_abbr} | {line}")
             
             final_log = "\n".join(log_lines)
-
+            
             # 6. GPT Analysis
             status_box.write("Consulting Coach...")
             prompt = f"""
@@ -298,20 +320,20 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             Target: {fname} {lname} ({tname})
             Matchup: {opp_str}
             
-            VEGAS LINES (FanDuel):
+            ODDS:
             {betting_lines}
             
             INJURIES:
             {tname}: {inj_home}
             {opp_name}: {inj_opp}
             
-            RECENT FORM (Last 5):
+            RECENT FORM (Last 7 Games):
             {final_log}
             
             Tasks:
-            1. **Line Value:** Compare his recent stats to the FanDuel lines.
-            2. **Prediction:** Do you recommend OVER or UNDER for Points?
-            3. **Reasoning:** Cite specific stats or injuries.
+            1. **Line Value:** Compare stats to the Odds (if Player Props available).
+            2. **Prediction:** Project Points/Rebounds/Assists.
+            3. **Recommendation:** Suggest a bet (Prop or Moneyline).
             """
             analysis = llm.invoke(prompt).content
             
@@ -335,12 +357,11 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             status_box.update(label="System Error", state="error")
             st.error(f"Error: {e}")
 
-    # --- DISPLAY RESULTS ---
+    # --- DISPLAY ---
     data = st.session_state.analysis_data
     
     if data:
         st.divider()
-        
         # Safe Access to avoid KeyErrors
         p_label = data.get('player', 'Unknown')
         m_label = data.get('matchup', 'Unknown')
@@ -349,7 +370,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
         st.markdown(f"### 📊 Report: {p_label} {m_label}")
         st.caption(f"Date: {d_label}")
         
-        st.info(f"🎰 **FanDuel Lines:**\n\n{data.get('odds', 'No odds data')}")
+        st.info(f"🎰 **FanDuel Odds:**\n\n{data.get('odds', 'No odds data')}")
         
         with st.expander("View Stats & Injuries", expanded=False):
             c1, c2 = st.columns(2)
@@ -370,7 +391,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             st.session_state.messages.append({"role": "user", "content": val})
             with st.chat_message("user"): st.markdown(val)
             with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
+                with st.spinner("..."):
                     ctx = data.get('context', '')
                     res = llm.invoke(f"CTX:\n{ctx}\nQ: {val}").content
                     st.markdown(res)
