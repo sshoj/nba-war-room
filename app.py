@@ -24,9 +24,9 @@ with st.sidebar:
     if rapid_key_input: os.environ["RAPID_KEY"] = rapid_key_input.strip()
     if openai_key_input: os.environ["OPENAI_API_KEY"] = openai_key_input.strip()
 
-# --- RAPID API TOOLS ---
+# --- RAPID API TOOLS (Now with Timeouts) ---
 def get_player_id(player_name):
-    """Finds the Player ID on RapidAPI"""
+    """Finds the Player ID on RapidAPI with a 10-second timeout."""
     url = f"https://{rapid_host}/players"
     querystring = {"search": player_name, "per_page": "100"}
     headers = {
@@ -35,19 +35,26 @@ def get_player_id(player_name):
     }
     
     try:
-        response = requests.get(url, headers=headers, params=querystring)
+        # TIMEOUT ADDED HERE: Wait max 10 seconds
+        response = requests.get(url, headers=headers, params=querystring, timeout=10)
+        response.raise_for_status() # Check if API returned a 403/500 error
         data = response.json()
         
         for p in data.get('data', []):
             full_name = f"{p['first_name']} {p['last_name']}"
             if player_name.lower() in full_name.lower():
                 return p['id'], full_name, p['team']['full_name']
-        return None, None, None
+        return None, None, "Player not found in database."
+        
+    except requests.exceptions.Timeout:
+        return None, None, "Error: Connection Timed Out (10s). API is slow."
+    except requests.exceptions.ConnectionError:
+        return None, None, "Error: No Internet or API Server is Down."
     except Exception as e:
-        return None, None, str(e)
+        return None, None, f"Error: {str(e)}"
 
 def get_last_5_games(player_id):
-    """Fetches the last 5 games stats for the player"""
+    """Fetches stats with a timeout."""
     url = f"https://{rapid_host}/stats"
     querystring = {
         "seasons[]": "2024", 
@@ -60,7 +67,9 @@ def get_last_5_games(player_id):
     }
     
     try:
-        response = requests.get(url, headers=headers, params=querystring)
+        # TIMEOUT ADDED HERE
+        response = requests.get(url, headers=headers, params=querystring, timeout=10)
+        response.raise_for_status()
         data = response.json()
         
         games = []
@@ -72,8 +81,11 @@ def get_last_5_games(player_id):
             games.append(f"Date: {date} | {matchup} | {stats}")
             
         return "\n".join(games) if games else "No games found for 2024-25 season."
+        
+    except requests.exceptions.Timeout:
+        return "Error: Connection Timed Out (10s)."
     except Exception as e:
-        return f"Error fetching stats: {e}"
+        return f"Error fetching stats: {str(e)}"
 
 # --- MAIN APP ---
 if rapid_key_input and openai_key_input:
@@ -95,20 +107,27 @@ if rapid_key_input and openai_key_input:
         stats_report = ""
         
         # --- PHASE 1: FETCH DATA ---
-        with st.spinner(f"Ping {rapid_host} for stats..."):
+        with st.spinner(f"Ping {rapid_host} (Max 10s)..."):
+            
+            # 1. Get ID (With error check)
             pid, full_name, team = get_player_id(p_name)
             
+            # STOPPAGE IF ERROR
             if not pid:
-                st.error(f"Player '{p_name}' not found on RapidAPI.")
-                st.stop()
+                # If 'team' variable contains an error message, show it
+                error_msg = team if team else "Unknown Error"
+                st.error(f"Failed to find player. {error_msg}")
+                st.stop() # <--- STOPS THE APP HERE
             
             st.success(f"Found: {full_name} ({team}) - ID: {pid}")
             
+            # 2. Get Stats (With error check)
             stats_report = get_last_5_games(pid)
             
+            # STOPPAGE IF ERROR
             if "Error" in stats_report:
                 st.error(stats_report)
-                st.stop()
+                st.stop() # <--- STOPS THE APP HERE
                 
             with st.expander("📊 Read Live Stats (Raw JSON)", expanded=True):
                 st.code(stats_report)
@@ -119,6 +138,7 @@ if rapid_key_input and openai_key_input:
                 try:
                     coach_prompt = f"""
                     You are an NBA Head Coach.
+                    
                     PLAYER: {full_name} ({team})
                     RECENT FORM (Last 5 Games):
                     {stats_report}
