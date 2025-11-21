@@ -27,7 +27,7 @@ with st.sidebar:
 BASE_URL = "https://api.balldontlie.io/v1"
 
 def get_headers():
-    # The official API uses 'Authorization' header, not 'X-RapidAPI-Key'
+    # The official API uses 'Authorization' header
     return {"Authorization": os.environ.get("BDL_API_KEY")}
 
 # --- ADVANCED TOOLS ---
@@ -49,7 +49,7 @@ def get_conference_rankings():
             rank_map[t_id] = f"{conf} #{rank}"
             
         return rank_map
-    except:
+    except Exception:
         return {}
 
 def get_player_info(name):
@@ -59,6 +59,65 @@ def get_player_info(name):
         params = {"search": name, "per_page": "1"}
         resp = requests.get(url, headers=get_headers(), params=params)
         data = resp.json()['data']
-        if not data: return None, None, None, None
-        return data[0]['id'], data[0]['first_name'], data[0]['last_name'], data[0]['team']['id']
-    except:
+        
+        if not data: 
+            return None, None, None, None
+            
+        p = data[0]
+        return p['id'], p['first_name'], p['last_name'], p['team']['id']
+    except Exception:
+        return None, None, None, None
+
+def get_team_schedule(team_id):
+    """Fetches the TEAM'S last 5 finished games"""
+    try:
+        url = f"{BASE_URL}/games"
+        # '2024' covers the 2024-2025 season in this API
+        params = {
+            "team_ids[]": str(team_id),
+            "seasons[]": "2024", 
+            "per_page": "10"
+        }
+        resp = requests.get(url, headers=get_headers(), params=params)
+        data = resp.json()['data']
+        
+        # Filter only 'Final' games and sort by date (newest first)
+        finished_games = [g for g in data if g['status'] == "Final"]
+        finished_games.sort(key=lambda x: x['date'], reverse=True)
+        
+        return finished_games[:5]
+    except Exception:
+        return []
+
+def get_game_stats(player_id, game_ids):
+    """Fetches stats for specific games to see if player played"""
+    if not game_ids: 
+        return []
+        
+    try:
+        url = f"{BASE_URL}/stats"
+        # We pass the list of Game IDs to filter specifically for them
+        params = {
+            "player_ids[]": str(player_id),
+            "per_page": "10",
+            "game_ids[]": [str(gid) for gid in game_ids] 
+        }
+        resp = requests.get(url, headers=get_headers(), params=params)
+        return resp.json()['data']
+    except Exception:
+        return []
+
+# --- MAIN APP ---
+if bdl_key and openai_key:
+    
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.5, api_key=openai_key)
+    
+    col1, col2 = st.columns(2)
+    with col1: p_name = st.text_input("Player Name", "Luka Doncic")
+    
+    if st.button("🚀 RUN ANALYSIS", type="primary"):
+        with st.spinner("Connecting to BallDontLie.io..."):
+            
+            # 1. Get Player & Team
+            res = get_player_info(p_name)
+            if not res or not res[0]:
