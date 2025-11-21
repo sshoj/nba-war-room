@@ -6,15 +6,15 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="NBA War Room (Official)", page_icon="🏀", layout="wide")
-st.title("🏀 NBA War Room (Official API)")
-st.markdown("**Logic:** Team Schedule First | **Season:** 2025-26 | **Coach:** GPT-4o")
+st.set_page_config(page_title="NBA War Room (All-Star)", page_icon="⭐", layout="wide")
+st.title("🏀 NBA War Room (All-Star Edition)")
+st.markdown("**Tier:** All-Star (Official API) | **Features:** Live Stats + Official Injuries")
 
-# --- SIDEBAR ---
+# --- SIDEBAR: SETTINGS ---
 with st.sidebar:
     st.header("⚙️ Settings")
     bdl_key = st.text_input("BallDontLie API Key", type="password")
-    st.caption("Get this from balldontlie.io")
+    st.caption("Must be All-Star Tier or higher")
     openai_key = st.text_input("OpenAI API Key", type="password")
     
     if bdl_key: os.environ["BDL_API_KEY"] = bdl_key.strip()
@@ -26,82 +26,67 @@ BASE_URL = "https://api.balldontlie.io/v1"
 def get_headers():
     return {"Authorization": os.environ.get("BDL_API_KEY")}
 
-# --- TOOLS ---
+# --- ALL-STAR TOOLS ---
 
-@st.cache_data(ttl=3600)
-def get_conference_rankings():
-    """Fetches standings to map Team ID -> Rank"""
+def get_team_injuries(team_id):
+    """
+    [ALL-STAR TIER EXCLUSIVE]
+    Fetches official injury report for a specific team.
+    """
     try:
-        url = f"{BASE_URL}/standings"
-        params = {"season": "2025"} 
+        url = f"{BASE_URL}/player_injuries"
+        params = {
+            "team_ids[]": str(team_id)
+        }
         resp = requests.get(url, headers=get_headers(), params=params)
         data = resp.json()['data']
         
-        rank_map = {}
-        for team in data:
-            t_id = team['team']['id']
-            conf = team['conference'].get('name', 'UNK')
-            rank = team['conference'].get('rank', 'N/A')
-            rank_map[t_id] = f"{conf} #{rank}"
+        if not data: return "No active injuries reported."
+        
+        reports = []
+        for i in data:
+            player = f"{i['player']['first_name']} {i['player']['last_name']}"
+            status = i['status'] # e.g., "Out", "Day-To-Day"
+            note = i['note'] # e.g., "Sprained Ankle"
+            reports.append(f"- **{player}**: {status} ({note})")
             
-        return rank_map
-    except:
-        return {}
+        return "\n".join(reports)
+    except Exception as e:
+        return f"Error fetching injuries: {e}"
 
 def get_player_info(name):
-    """Finds Player and their Team ID"""
     try:
         url = f"{BASE_URL}/players"
         params = {"search": name, "per_page": "1"}
         resp = requests.get(url, headers=get_headers(), params=params)
         data = resp.json()['data']
-        
-        if not data: 
-            return None, None, None, None
-            
+        if not data: return None, None, None, None, None
         p = data[0]
-        # Return ID, First, Last, Team ID, Team Name
         return p['id'], p['first_name'], p['last_name'], p['team']['id'], p['team']['full_name']
-    except:
-        return None, None, None, None, None
+    except: return None, None, None, None, None
 
 def get_team_schedule_before_today(team_id):
-    """
-    CRITICAL FIX:
-    1. Searches games for THIS Team (Season 2025).
-    2. Filters for dates BEFORE today.
-    3. Sorts by newest first.
-    """
     try:
         url = f"{BASE_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
-        
         params = {
             "team_ids[]": str(team_id),
             "seasons[]": "2025", 
-            "end_date": today, # STRICTLY before or on today
-            "per_page": "20"   # Get enough to filter
+            "end_date": today,
+            "per_page": "20"
         }
         resp = requests.get(url, headers=get_headers(), params=params)
         data = resp.json()['data']
-        
-        # Filter: Must be "Final" to have stats
         finished_games = [g for g in data if g['status'] == "Final"]
-        
-        # Sort Descending (Newest First)
         finished_games.sort(key=lambda x: x['date'], reverse=True)
-        
-        return finished_games[:5] # Return exactly 5
-    except:
-        return []
+        return finished_games[:5]
+    except: return []
 
 def get_next_game(team_id):
-    """Finds the NEXT game (Today or Future)"""
     try:
         url = f"{BASE_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
         future = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
-        
         params = {
             "team_ids[]": str(team_id),
             "seasons[]": "2025",
@@ -111,36 +96,30 @@ def get_next_game(team_id):
         }
         resp = requests.get(url, headers=get_headers(), params=params)
         data = resp.json()['data']
+        if not data: return None, "No games found.", None
         
-        if not data: return None, "No games found in next 14 days."
-        
-        # Sort Ascending (Soonest First)
         data.sort(key=lambda x: x['date'])
-        
         game = data[0]
         
-        # Determine Opponent
+        # Determine Opponent ID for Injury Lookup
         if game['home_team']['id'] == team_id:
-            opp_name = game['visitor_team']['full_name']
+            opp_team = game['visitor_team']
             loc = "vs"
         else:
-            opp_name = game['home_team']['full_name']
+            opp_team = game['home_team']
             loc = "@"
             
         date_str = game['date'].split("T")[0]
-        return f"{loc} {opp_name}", date_str
-        
-    except: return None, "Error finding schedule."
+        return f"{loc} {opp_team['full_name']}", date_str, opp_team['id'], opp_team['full_name']
+    except: return None, "Error.", None, None
 
 def get_stats_for_specific_games(player_id, game_ids):
-    """Fetches stats ONLY for the Game IDs found in the schedule"""
     if not game_ids: return []
     try:
         url = f"{BASE_URL}/stats"
         params = {
             "player_ids[]": str(player_id),
             "per_page": "10",
-            # This forces the API to only look at the specific team games we found
             "game_ids[]": [str(g) for g in game_ids]
         }
         resp = requests.get(url, headers=get_headers(), params=params)
@@ -155,49 +134,65 @@ if bdl_key and openai_key:
     col1, col2 = st.columns(2)
     with col1: p_name = st.text_input("Player Name", "Luka Doncic")
     
-    # Show Today's Date
     today_display = datetime.now().strftime("%A, %B %d, %Y")
-    st.caption(f"📅 Today's Date: **{today_display}**")
+    st.caption(f"📅 Today: **{today_display}**")
     
-    if st.button("🚀 RUN PRO ANALYSIS", type="primary"):
-        with st.spinner("Analyzing Schedule & Stats..."):
+    if st.button("🚀 RUN ALL-STAR ANALYSIS", type="primary"):
+        with st.spinner("Accessing Official NBA Database..."):
             
-            # 1. Get Player
+            # 1. Player Info
             res = get_player_info(p_name)
             if not res or not res[0]:
                 st.error("Player not found.")
                 st.stop()
                 
             pid, fname, lname, team_id, team_name = res
-            st.success(f"Found: **{fname} {lname}** (Team: {team_name})")
+            st.success(f"Found: **{fname} {lname}** ({team_name})")
             
-            # 2. Get Next Game
-            opp_next, date_next = get_next_game(team_id)
-            if opp_next:
-                st.info(f"🏀 **NEXT GAME:** {opp_next} | 📅 {date_next}")
+            # 2. Next Game (And Opponent ID)
+            opp_str, date_next, opp_id, opp_real_name = get_next_game(team_id)
+            
+            if opp_str:
+                st.info(f"🏀 **NEXT GAME:** {opp_str} | 📅 {date_next}")
             else:
                 st.warning("No upcoming games found.")
+                opp_real_name = "Unknown"
+
+            # 3. OFFICIAL INJURY REPORT (All-Star Exclusive)
+            st.write("---")
+            col_a, col_b = st.columns(2)
             
-            # 3. Get Past 5 Games (The Team's Schedule)
+            with col_a:
+                st.subheader(f"🏥 {team_name}")
+                if team_id:
+                    injuries_home = get_team_injuries(team_id)
+                    st.info(injuries_home)
+                else:
+                    st.write("No data.")
+
+            with col_b:
+                st.subheader(f"🏥 {opp_real_name}")
+                if opp_id:
+                    injuries_opp = get_team_injuries(opp_id)
+                    st.error(injuries_opp)
+                else:
+                    st.write("No opponent data.")
+
+            # 4. Past Games
             past_games = get_team_schedule_before_today(team_id)
             if not past_games:
-                st.error("No recent games found for this team in 2025.")
+                st.error("No recent games found.")
                 st.stop()
                 
-            # 4. Get Stats for those specific games
             game_ids = [g['id'] for g in past_games]
             player_stats = get_stats_for_specific_games(pid, game_ids)
             
-            # 5. Get Rankings
-            rank_map = get_conference_rankings()
-            
-            # 6. Build the Log
+            # 5. Build Log
             log_lines = []
             for game in past_games:
                 gid = game['id']
                 date = game['date'].split("T")[0]
                 
-                # Determine Opponent
                 if game['home_team']['id'] == team_id:
                     opp_team = game['visitor_team']
                     loc = "vs"
@@ -205,51 +200,46 @@ if bdl_key and openai_key:
                     opp_team = game['home_team']
                     loc = "@"
                 
-                opp_abbr = opp_team['abbreviation']
-                opp_rank = rank_map.get(opp_team['id'], "")
-                
-                # Find the stat line for this specific game
                 stat = next((s for s in player_stats if s['game']['id'] == gid), None)
                 
                 if stat and stat['min']:
-                    # Calculate FG%
                     fg_pct = f"{stat['fg_pct']*100:.1f}%" if stat['fg_pct'] else "0%"
-                    
-                    # Extract 3PT
-                    fg3m = stat['fg3m']
-                    fg3a = stat['fg3a']
-                    fg3_str = f"{fg3m}/{fg3a}"
-                    
                     line = (f"MIN:{stat['min']} | PTS:{stat['pts']} REB:{stat['reb']} AST:{stat['ast']} | "
-                            f"FG:{fg_pct} 3PT:{fg3_str}")
+                            f"FG:{fg_pct}")
                 else:
                     line = "❌ OUT (DNP)"
                     
-                log_lines.append(f"[{date}] {loc} {opp_abbr} {opp_rank} | {line}")
+                log_lines.append(f"[{date}] {loc} {opp_team['abbreviation']} | {line}")
                 
             final_log = "\n".join(log_lines)
             
-            with st.expander("📊 Verified Game Log (Season 2025-26)", expanded=True):
+            with st.expander("📊 Game Log (Season 2025-26)", expanded=True):
                 st.code(final_log)
                 
-            # 7. GPT Analysis
+            # 6. GPT Analysis
             prompt = f"""
-            Analyze NBA Player: {fname} {lname} ({team_name})
-            TODAY: {today_display}
-            NEXT MATCHUP: {opp_next}
+            You are an Expert NBA Analyst.
             
-            OFFICIAL GAME LOG (Last 5 Team Games):
+            TARGET: {fname} {lname} ({team_name})
+            OPPONENT: {opp_real_name}
+            
+            OFFICIAL INJURY REPORT:
+            - {team_name}: {injuries_home}
+            - {opp_real_name}: {injuries_opp}
+            
+            GAME LOG (Last 5):
             {final_log}
             
             TASK:
-            1. **Availability:** Is he missing games? (Look for "OUT" tags).
-            2. **Performance:** If playing, is he hitting his averages? Check FG% and 3PT volume.
-            3. **Prediction:** Project stats (PTS/REB/AST) vs {opp_next}.
+            1. **Injury Impact:** How do the specific injuries on BOTH teams affect {lname}'s role?
+            2. **Matchup:** Given the opponent's injuries, does he have an advantage?
+            3. **Prediction:** Project stats (PTS/REB/AST).
             """
             
             response = llm.invoke(prompt).content
             st.divider()
+            st.markdown("### 🧠 Coach's Verdict")
             st.write(response)
 
 elif not bdl_key:
-    st.warning("⚠️ Please enter your BallDontLie API Key.")
+    st.warning("⚠️ Enter your All-Star API Key.")
