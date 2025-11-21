@@ -409,7 +409,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                 
                 stat = next((s for s in p_stats if s["game"]["id"] == gid), None)
                 
-                # STRICT DNP CHECK
+                               # STRICT DNP CHECK
                 min_val = stat.get("min") if stat else None
                 played = bool(
                     min_val
@@ -418,7 +418,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
 
                 if played:
                     fg = f"{stat['fg_pct']*100:.0f}%" if stat.get("fg_pct") else "0%"
-                    fg3 = f"{stat.get("fg3m", 0)}/{stat.get("fg3a", 0)}"
+                    fg3 = f"{stat.get('fg3m', 0)}/{stat.get('fg3a', 0)}"
                     line = (
                         f"MIN:{min_val} | PTS:{stat.get('pts',0)} "
                         f"REB:{stat.get('reb',0)} AST:{stat.get('ast',0)} | FG:{fg} 3PT:{fg3}"
