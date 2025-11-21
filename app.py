@@ -249,7 +249,7 @@ def get_betting_odds(player_name, team_name):
         return "Odds API Key missing."
 
     try:
-        # 1. Get Games list (events) – NOTE: /events only needs apiKey
+        # 1. Get Games list (events) – /events only needs apiKey
         games_resp = requests.get(
             f"{ODDS_URL}/events",
             params={"apiKey": api_key},
@@ -257,7 +257,6 @@ def get_betting_odds(player_name, team_name):
         )
 
         if games_resp.status_code != 200:
-            # Show response text too, so you see WHY it's 401
             try:
                 msg = games_resp.json().get("message", games_resp.text)
             except Exception:
@@ -286,8 +285,7 @@ def get_betting_odds(player_name, team_name):
         if not game_id:
             return f"No active betting lines found for {team_name}."
 
-        # 2. Try Player Props First ...
-        # (keep the rest of your function the same)
+        # 2. Try Player Props First
         props_resp = requests.get(
             f"{ODDS_URL}/events/{game_id}/odds",
             params={
@@ -392,7 +390,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             inj_home = get_team_injuries(tid) if tid else "N/A"
             inj_opp = get_team_injuries(opp_id) if opp_id else "N/A"
 
-            # 5. Stats (Last 7 Games + Strict DNP) + NEW: structured rows for DataFrame/chart
+            # 5. Stats (Last 7 Games + Strict DNP)
             status_box.write("Crunching stats...")
             past_games = get_team_schedule_before_today(tid, n_games=7)
             gids = [g["id"] for g in past_games]
@@ -417,7 +415,7 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                 
                 stat = next((s for s in p_stats if s["game"]["id"] == gid), None)
                 
-                               # STRICT DNP CHECK
+                # STRICT DNP CHECK
                 min_val = stat.get("min") if stat else None
                 played = bool(
                     min_val
@@ -449,8 +447,49 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                         "Is_DNP": not played,
                     }
                 )
-            
+
             final_log = "\n".join(log_lines)
+
+            # NEW FEATURE: Opponent team's last 7 results
+            opp_results_rows = []
+            if opp_id:
+                opp_past_games = get_team_schedule_before_today(opp_id, n_games=7)
+                for g in opp_past_games:
+                    d = g["date"].split("T")[0]
+                    home = g.get("home_team", {})
+                    visitor = g.get("visitor_team", {})
+                    home_score = g.get("home_team_score", 0)
+                    visitor_score = g.get("visitor_team_score", 0)
+
+                    is_home = home.get("id") == opp_id
+                    loc = "vs" if is_home else "@"
+                    opp_team_obj = visitor if is_home else home
+                    opp_abbr = opp_team_obj.get("abbreviation", "UNK")
+
+                    if is_home:
+                        team_score = home_score
+                        opp_score = visitor_score
+                    else:
+                        team_score = visitor_score
+                        opp_score = home_score
+
+                    if team_score > opp_score:
+                        result = "W"
+                    elif team_score < opp_score:
+                        result = "L"
+                    else:
+                        result = "T"
+
+                    opp_results_rows.append(
+                        {
+                            "Date": d,
+                            "Location": loc,
+                            "Opponent": opp_abbr,
+                            "Team Score": team_score,
+                            "Opponent Score": opp_score,
+                            "Result": result,
+                        }
+                    )
             
             # 6. GPT Analysis
             status_box.write("Consulting Coach...")
@@ -491,6 +530,8 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
                 "inj_opp": inj_opp,
                 "context": prompt + "\n\nAnalysis:\n" + analysis,
                 "stats_rows": stats_rows,
+                "opp_results_rows": opp_results_rows,
+                "opp_name": opp_name,
             }
             st.session_state.messages = [{"role": "assistant", "content": analysis}]
             status_box.update(label="Ready!", state="complete", expanded=False)
@@ -522,6 +563,26 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             df_stats = pd.DataFrame(stats_rows)
             st.dataframe(df_stats, use_container_width=True)
 
+            # NEW FEATURE: Last game where player actually played (non-DNP)
+            last_played = next((row for row in stats_rows if not row["Is_DNP"]), None)
+            if last_played:
+                st.subheader("Last Game Played (Most Recent Non-DNP)")
+                st.table(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Date": last_played["Date"],
+                                "Location": last_played["Location"],
+                                "Opponent": last_played["Opponent"],
+                                "MIN": last_played["MIN"],
+                                "PTS": last_played["PTS"],
+                                "REB": last_played["REB"],
+                                "AST": last_played["AST"],
+                            }
+                        ]
+                    )
+                )
+
             # Line chart for PTS / REB / AST (excluding DNP)
             try:
                 df_played = df_stats[~df_stats["Is_DNP"]].copy()
@@ -531,6 +592,14 @@ if api_keys["bdl"] and api_keys["openai"] and api_keys["odds"]:
             except Exception:
                 # Fail silently if charting has any issue
                 pass
+
+        # NEW FEATURE: Opponent team last 7 results
+        opp_rows = data.get("opp_results_rows")
+        if opp_rows:
+            opp_name = data.get("opp_name", "Opponent Team")
+            st.subheader(f"{opp_name} – Recent Results (Last 7)")
+            df_opp = pd.DataFrame(opp_rows)
+            st.dataframe(df_opp, use_container_width=True)
         
         with st.expander("View Stats & Injuries", expanded=False):
             c1, c2 = st.columns(2)
