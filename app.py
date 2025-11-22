@@ -99,6 +99,13 @@ def parse_minutes(min_str):
         return 0.0
 
 
+def normalize_team_name(name: str) -> str:
+    """Normalize team name for fuzzy matching (remove spaces/punct, lower)."""
+    if not name:
+        return ""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
 def get_team_logo_url(team_abbr: str):
     """
     Maps API abbreviations to ESPN Logo URLs.
@@ -122,6 +129,7 @@ def get_team_logo_url(team_abbr: str):
 
     espn_code = corrections.get(abbr, abbr.lower())
     return f"https://a.espncdn.com/i/teamlogos/nba/500/scoreboard/{espn_code}.png"
+
 
 # --- BALLDONTLIE TOOLS ---
 
@@ -251,76 +259,6 @@ def get_stats_for_games(player_id, game_ids):
         return []
 
 
-def get_next_game(team_id):
-    """
-    Get the *nearest* upcoming game for a team:
-    - Looks from today to 14 days ahead.
-    - Skips games with status 'Final'.
-    - Sorts by BDL game date and picks the earliest.
-    """
-    try:
-        url = f"{BDL_URL}/games"
-        today = datetime.now().strftime("%Y-%m-%d")
-        future = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
-        season = get_current_season()
-        params = {
-            "team_ids[]": str(team_id),
-            "seasons[]": str(season),
-            "start_date": today,
-            "end_date": future,
-            "per_page": "50",
-        }
-        resp = requests.get(
-            url,
-            headers=get_bdl_headers(),
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            return None, "Error fetching next game.", None, None, None
-        data = resp.json().get("data", [])
-        if not data:
-            return None, "No games found.", None, None, None
-
-        # Filter out Final; sort by raw date from API
-        upcoming = [g for g in data if g.get("status") != "Final"]
-
-        if not upcoming:
-            return None, "No upcoming games.", None, None, None
-
-        def parse_game_dt(g):
-            date_str = g.get("date")
-            if not date_str:
-                return datetime.max
-            try:
-                return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            except Exception:
-                try:
-                    return datetime.fromisoformat(date_str)
-                except Exception:
-                    return datetime.max
-
-        upcoming.sort(key=parse_game_dt)
-        game = upcoming[0]
-
-        if game["home_team"]["id"] == team_id:
-            opp = game["visitor_team"]
-            loc = "vs"
-        else:
-            opp = game["home_team"]
-            loc = "@"
-
-        opp_name = opp.get("full_name", "Unknown")
-        opp_abbr = opp.get("abbreviation", "")
-        matchup = f"{loc} {opp_name}"
-        game_date = game["date"].split("T")[0]
-
-        return matchup, game_date, opp.get("id"), opp_name, opp_abbr
-
-    except Exception:
-        return None, "Error fetching next game.", None, None, None
-
-
 def compute_team_form(past_games, team_id):
     """Compute simple PF/PA/net and record for last N games."""
     if not past_games:
@@ -387,6 +325,35 @@ def get_team_players(team_id):
         return {}
 
 
+def get_bdl_team_by_name(name: str):
+    """Given a plain team name (from Odds API), find the best-matching BallDontLie team."""
+    try:
+        resp = requests.get(
+            f"{BDL_URL}/teams",
+            headers=get_bdl_headers(),
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return {}
+        data = resp.json().get("data", [])
+        if not isinstance(data, list):
+            data = []
+
+        target = normalize_team_name(name)
+        best = None
+        best_score = 0.0
+        for t in data:
+            full_name = t.get("full_name", "")
+            n = normalize_team_name(full_name)
+            score = difflib.SequenceMatcher(a=target, b=n).ratio()
+            if score > best_score:
+                best_score = score
+                best = t
+        return best or {}
+    except Exception:
+        return {}
+
+
 def get_team_rotation(team_id, n_games: int = 7):
     """
     Approximate rotation for a team:
@@ -422,7 +389,6 @@ def get_team_rotation(team_id, n_games: int = 7):
 
     # Aggregate minutes & stats for this team only
     per_player = {}
-    # Also capture names/positions directly from stats (for players not on current roster)
     stats_players = {}
 
     for s in stats:
@@ -435,7 +401,6 @@ def get_team_rotation(team_id, n_games: int = 7):
         if not pid:
             continue
 
-        # Save player info from stats
         if pid not in stats_players:
             stats_players[pid] = {
                 "name": f"{player.get('first_name', '')} {player.get('last_name', '')}".strip(),
@@ -464,14 +429,12 @@ def get_team_rotation(team_id, n_games: int = 7):
         per_player[pid]["total_ast"] += ast
         per_player[pid]["total_3pm"] += fg3m
 
-        # Count as game played if they actually got on the floor
         if min_val > 0:
             per_player[pid]["gp_non_dnp"] += 1
 
     if not per_player:
         return [], total_games_used
 
-    # Roster also helps for current team position info
     roster = get_team_players(team_id)
     rows = []
     for pid, agg in per_player.items():
@@ -510,35 +473,36 @@ def get_team_rotation(team_id, n_games: int = 7):
             }
         )
 
-    # Sort by avg minutes
     rows.sort(key=lambda r: r["Avg MIN"], reverse=True)
-    # Label roles
     for idx, r in enumerate(rows):
         r["Role"] = "Starter" if idx < 5 else "Bench/Rotation"
     return rows, total_games_used
 
-# --- BETTING API TOOLS ---
 
-def get_betting_odds(player_name, team_name, bookmakers=None):
+# --- BETTING API TOOLS (NOW CANONICAL FOR NEXT GAME) ---
+
+def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
     """
-    Fetch betting lines with error handling.
+    Canonical source of the upcoming game for this player/team.
 
-    Returns:
-        (odds_text, tipoff_utc_iso_str)
-
-    - Uses /events to find the *closest* game by commence_time for this team.
-    - Uses /events/{id}/odds with markets=player_points,player_rebounds,player_assists,h2h.
-    - Player props:
-        - Taken from a single bookmaker (prefer FanDuel, else first).
-    - Moneyline:
-        - Collected from ALL bookmakers in the response (all betting choices).
+    Returns dict:
+    {
+      "odds_text": str,
+      "tipoff_iso": str or None,
+      "home_team": str or None,
+      "away_team": str or None,
+    }
     """
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
-        return "Betting API key missing.", None
+        return {
+            "odds_text": "Betting API key missing.",
+            "tipoff_iso": None,
+            "home_team": None,
+            "away_team": None,
+        }
 
     try:
-        # 1. Get Games list (events)
         games_resp = requests.get(
             f"{ODDS_URL}/events",
             params={"apiKey": api_key},
@@ -550,53 +514,91 @@ def get_betting_odds(player_name, team_name, bookmakers=None):
                 msg = games_resp.json().get("message", games_resp.text)
             except Exception:
                 msg = games_resp.text
-            return f"Error fetching games from Betting API (status {games_resp.status_code}): {msg}", None
+            return {
+                "odds_text": f"Error fetching games from Betting API (status {games_resp.status_code}): {msg}",
+                "tipoff_iso": None,
+                "home_team": None,
+                "away_team": None,
+            }
 
         games = games_resp.json()
         if not isinstance(games, list) or not games:
-            return "No betting lines available.", None
+            return {
+                "odds_text": "No betting lines available.",
+                "tipoff_iso": None,
+                "home_team": None,
+                "away_team": None,
+            }
 
-        team_name_lower = team_name.lower()
-
-        # --- choose the nearest event for this team by commence_time ---
+        team_norm = normalize_team_name(team_name)
+        # Pick nearest future event where team_name matches home or away
         best_game = None
         best_time = None
 
-        for g in games:
-            ht = (g.get("home_team") or "").lower()
-            at = (g.get("away_team") or "").lower()
+        now = datetime.utcnow()
 
-            if team_name_lower not in ht and team_name_lower not in at:
+        for g in games:
+            ht = g.get("home_team") or ""
+            at = g.get("away_team") or ""
+            if team_norm not in normalize_team_name(ht) and team_norm not in normalize_team_name(at):
                 continue
 
             ct = g.get("commence_time")
             if not ct:
                 continue
-
             try:
-                # Example: "2024-11-21T19:30:00Z"
                 g_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
             except Exception:
+                continue
+
+            if g_dt < now:
+                # game already started / past – still could be relevant for props,
+                # but for "upcoming game" UX we favor future or nearest-time.
                 continue
 
             if best_time is None or g_dt < best_time:
                 best_time = g_dt
                 best_game = g
 
+        # If nothing in future, fallback to ANY match (closest in time)
         if not best_game:
-            return f"No active betting lines found for {team_name}.", None
+            for g in games:
+                ht = g.get("home_team") or ""
+                at = g.get("away_team") or ""
+                if team_norm not in normalize_team_name(ht) and team_norm not in normalize_team_name(at):
+                    continue
+                ct = g.get("commence_time")
+                if not ct:
+                    continue
+                try:
+                    g_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if best_time is None or g_dt < best_time:
+                    best_time = g_dt
+                    best_game = g
+
+        if not best_game:
+            return {
+                "odds_text": f"No active betting lines found for {team_name}.",
+                "tipoff_iso": None,
+                "home_team": None,
+                "away_team": None,
+            }
 
         game_id = best_game.get("id")
-        tipoff_iso = best_game.get("commence_time")  # Keep raw ISO from API
+        tipoff_iso = best_game.get("commence_time")
+        home_team = best_game.get("home_team")
+        away_team = best_game.get("away_team")
 
-        # 2. Get props + moneyline in ONE call
+        # 2. Odds for that exact event
         params = {
             "apiKey": api_key,
             "regions": "us",
             "markets": "player_points,player_rebounds,player_assists,h2h",
         }
         if bookmakers:
-            params["bookmakers"] = bookmakers  # e.g. "fanduel,draftkings,betmgm"
+            params["bookmakers"] = bookmakers
 
         odds_resp = requests.get(
             f"{ODDS_URL}/events/{game_id}/odds",
@@ -608,17 +610,26 @@ def get_betting_odds(player_name, team_name, bookmakers=None):
                 msg = odds_resp.json().get("message", odds_resp.text)
             except Exception:
                 msg = odds_resp.text
-            return f"Error fetching odds (status {odds_resp.status_code}): {msg}", tipoff_iso
+            return {
+                "odds_text": f"Error fetching odds (status {odds_resp.status_code}): {msg}",
+                "tipoff_iso": tipoff_iso,
+                "home_team": home_team,
+                "away_team": away_team,
+            }
 
         data = odds_resp.json()
         bookmakers_list = data.get("bookmakers", [])
         if not bookmakers_list:
-            return "No odds available.", tipoff_iso
+            return {
+                "odds_text": "No odds available.",
+                "tipoff_iso": tipoff_iso,
+                "home_team": home_team,
+                "away_team": away_team,
+            }
 
-        # --- Player Props from ONE bookmaker (prefer FanDuel, else first) ---
+        # Player props from preferred book
         props_lines = []
         props_bookmaker_title = None
-
         preferred_key = "fanduel"
         props_bookmaker = next(
             (b for b in bookmakers_list if b.get("key") == preferred_key),
@@ -640,7 +651,7 @@ def get_betting_odds(player_name, team_name, bookmakers=None):
                         price = outcome.get("price", "N/A")
                         props_lines.append(f"**{market_name}**: {line} ({price})")
 
-        # --- Moneyline from ALL bookmakers ---
+        # Moneyline from all books
         moneyline_lines = []
         for b in bookmakers_list:
             b_title = b.get("title") or b.get("key", "Book")
@@ -657,23 +668,32 @@ def get_betting_odds(player_name, team_name, bookmakers=None):
             ml_str = " vs ".join(parts)
             moneyline_lines.append(f"- **{b_title}**: {ml_str}")
 
-        # --- Build final string for display ---
         sections = []
-
         if props_lines:
             label = f"**Player Props ({props_bookmaker_title})**" if props_bookmaker_title else "**Player Props**"
             sections.append(label + ":\n" + " | ".join(props_lines))
-
         if moneyline_lines:
             sections.append("**Game Moneyline (All Books):**\n" + "\n".join(moneyline_lines))
 
+        odds_text = "No odds available."
         if sections:
-            return "\n\n".join(sections), tipoff_iso
+            odds_text = "\n\n".join(sections)
 
-        return "No odds available.", tipoff_iso
+        return {
+            "odds_text": odds_text,
+            "tipoff_iso": tipoff_iso,
+            "home_team": home_team,
+            "away_team": away_team,
+        }
 
     except Exception as e:
-        return f"Error fetching odds: {e}", None
+        return {
+            "odds_text": f"Error fetching odds: {e}",
+            "tipoff_iso": None,
+            "home_team": None,
+            "away_team": None,
+        }
+
 
 # --- CORE ANALYSIS PIPELINE ---
 
@@ -698,15 +718,49 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         tabbr = player_obj["team"]["abbreviation"]
         st.success(msg)
 
-        # 2. Schedule / Next Game
-        status_box.write("Checking schedule...")
-        opp_str, date, opp_id, opp_name, opp_abbr = get_next_game(tid)
-        if not opp_str:
-            opp_name = "Unknown"
+        # 2. Betting Game (canonical next game) + Odds
+        status_box.write("Finding betting event & lines...")
+        betting = get_betting_game_and_odds(f"{fname} {lname}", tname)
+        betting_lines = betting["odds_text"]
+        tipoff_iso = betting["tipoff_iso"]
+        odds_home = betting["home_team"]
+        odds_away = betting["away_team"]
 
-        # 3. Betting Odds (props + multi-book moneyline + tipoff time)
-        status_box.write("Checking lines...")
-        betting_lines, tipoff_iso = get_betting_odds(f"{fname} {lname}", tname)
+        # Derive matchup + date from Odds event
+        matchup = "Unknown matchup"
+        game_date_display = "Unknown date"
+        opp_name = "Unknown opponent"
+
+        if odds_home and odds_away:
+            norm_team = normalize_team_name(tname)
+            home_norm = normalize_team_name(odds_home)
+            away_norm = normalize_team_name(odds_away)
+
+            if norm_team in home_norm:
+                opp_name = odds_away
+                loc = "vs"
+            elif norm_team in away_norm:
+                opp_name = odds_home
+                loc = "@"
+            else:
+                # fallback: assume home team is player's team
+                opp_name = odds_away
+                loc = "vs"
+
+            matchup = f"{loc} {opp_name}"
+
+        if tipoff_iso:
+            try:
+                tip_dt = datetime.fromisoformat(tipoff_iso.replace("Z", "+00:00"))
+                game_date_display = tip_dt.date().isoformat()
+            except Exception:
+                pass
+
+        # 3. Get opponent team info from BDL (for injuries, stats, rotation)
+        opp_team_bdl = get_bdl_team_by_name(opp_name)
+        opp_id = opp_team_bdl.get("id")
+        opp_abbr = opp_team_bdl.get("abbreviation", "")
+        opp_name_bdl = opp_team_bdl.get("full_name", opp_name)
 
         # 4. Injuries
         status_box.write("Fetching injuries...")
@@ -760,7 +814,6 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
 
             log_lines.append(f"[{d}] {loc} {opp_abbr_log} | {line}")
 
-            # Structured stats for DataFrame/chart
             mins_numeric = parse_minutes(min_val_raw) if played else 0
             stats_rows.append(
                 {
@@ -779,7 +832,7 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
 
         final_log = "\n".join(log_lines)
 
-        # 6. Opponent team's last 7 results
+        # 6. Opponent team's last 7 results (from BDL)
         opp_results_rows = []
         if opp_id:
             opp_past_games = get_team_schedule_before_today(opp_id, n_games=7)
@@ -823,27 +876,26 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         # 7. Team form snapshot (strength/weakness proxy)
         team_form = compute_team_form(past_games, tid)
 
-        # 8. Team rotation (positions + avg minutes & stats)
+        # 8. Rotations
         rotation_rows, rotation_games_used = get_team_rotation(tid, n_games=7)
-
-        # 9. Opponent rotation (same style)
         opp_rotation_rows, opp_rotation_games_used = ([], 0)
         if opp_id:
             opp_rotation_rows, opp_rotation_games_used = get_team_rotation(opp_id, n_games=7)
 
-        # 10. GPT Analysis
+        # 9. GPT Analysis
         status_box.write("Consulting AI coach...")
         prompt = f"""
 Role: Expert Sports Bettor.
 Target: {fname} {lname} ({tname})
-Matchup: {opp_str}
+Matchup: {matchup}
+Game Date: {game_date_display}
 
 ODDS:
 {betting_lines}
 
 INJURIES:
 {tname}: {inj_home}
-{opp_name}: {inj_opp}
+{opp_name_bdl}: {inj_opp}
 
 RECENT FORM (Last 7 Team Games):
 {final_log}
@@ -870,12 +922,10 @@ Rules:
         # Save in session state
         st.session_state.analysis_data = {
             "player": f"{fname} {lname}",
-            "player_first": fname,
-            "player_last": lname,
             "team_name": tname,
             "team_abbr": tabbr,
-            "matchup": opp_str,
-            "date": date,
+            "matchup": matchup,
+            "date": game_date_display,
             "odds": betting_lines,
             "log": final_log,
             "analysis": analysis,
@@ -884,7 +934,7 @@ Rules:
             "context": prompt + "\n\nAnalysis:\n" + analysis,
             "stats_rows": stats_rows,
             "opp_results_rows": opp_results_rows,
-            "opp_name": opp_name,
+            "opp_name": opp_name_bdl,
             "opp_abbr": opp_abbr,
             "team_form": team_form,
             "rotation_rows": rotation_rows,
@@ -901,17 +951,16 @@ Rules:
         status_box.update(label="System Error", state="error")
         st.error(f"Error: {e}")
 
+
 # --- MAIN APP ENTRY ---
 
 if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
 
-    # Create LLM client
     llm = ChatOpenAI(model="gpt-4o", temperature=0.5, api_key=api_keys["openai"])
 
-    # Top input row
     col1, col2 = st.columns([3, 1])
     with col1:
-        p_name = st.text_input("Player Name", "Luka Doncic")
+        p_name = st.text_input("Player Name", "Devin Booker")
     with col2:
         st.write("")
         st.write("")
@@ -920,7 +969,6 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
     if run_btn:
         run_analysis(p_name, llm)
 
-    # --- DISPLAY SECTION ---
     data = st.session_state.analysis_data
 
     if data:
@@ -947,22 +995,17 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             st.markdown(f"### 📊 Report: {p_label}  \n**Matchup:** {m_label}")
             st.caption(f"Date: {d_label}")
 
-            # Countdown to tipoff (approx) from Betting API
             tipoff_iso = data.get("tipoff_iso")
             if tipoff_iso:
                 try:
                     tip_dt = datetime.fromisoformat(tipoff_iso.replace("Z", "+00:00"))
-                    tip_dt_naive = tip_dt.replace(tzinfo=None)
                     now = datetime.utcnow()
-                    delta = tip_dt_naive - now
+                    delta = tip_dt - now
                     secs = int(delta.total_seconds())
                     if secs > 0:
                         hours, rem = divmod(secs, 3600)
                         minutes, _ = divmod(rem, 60)
-                        st.metric(
-                            "Time to tipoff (approx)",
-                            f"{hours}h {minutes}m"
-                        )
+                        st.metric("Time to tipoff (approx)", f"{hours}h {minutes}m")
                     else:
                         st.metric("Time to tipoff (approx)", "Tipoff passed")
                 except Exception:
@@ -975,7 +1018,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
 
         st.info(f"🎰 **Market Odds:**\n\n{data.get('odds', 'No odds data')}")
 
-        # Team Form metrics (strength/weakness proxy)
+        # Team Form metrics
         team_form = data.get("team_form") or {}
         if team_form:
             games_used = team_form.get("games_used", 0) or 0
@@ -987,7 +1030,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             c3.metric("Net Rating (approx)", f"{team_form.get('net', 0):+.1f}")
             c4.metric("Record", f"{team_form.get('wins', 0)}–{team_form.get('losses', 0)}")
 
-        # Rotation & Positions (home team)
+        # Rotations
         rotation_rows = data.get("rotation_rows")
         rotation_games_used = data.get("rotation_games_used", 0)
         if rotation_rows:
@@ -1001,7 +1044,6 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
                 df_rot = df_rot.drop(columns=["Player ID"])
             st.dataframe(df_rot, use_container_width=True)
 
-        # Rotation & Positions (opponent team)
         opp_rotation_rows = data.get("opp_rotation_rows")
         opp_rotation_games_used = data.get("opp_rotation_games_used", 0)
         if opp_rotation_rows:
@@ -1016,12 +1058,11 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
                 df_opp_rot = df_opp_rot.drop(columns=["Player ID"])
             st.dataframe(df_opp_rot, use_container_width=True)
 
-        # Player recent stats table + chart + KPI metrics
+        # Player stats + KPIs
         stats_rows = data.get("stats_rows")
         if stats_rows:
             df_stats = pd.DataFrame(stats_rows)
 
-            # Player KPI metrics (averages over last games played)
             try:
                 df_played = df_stats[~df_stats["Is_DNP"]].copy()
                 if not df_played.empty:
@@ -1041,11 +1082,9 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             except Exception:
                 pass
 
-            # Game Log table
             st.subheader(f"📜 {p_label} – Game Log (Last Team Games)")
             st.dataframe(df_stats, use_container_width=True)
 
-            # Last game where player actually played (non-DNP)
             last_played = next((row for row in stats_rows if not row["Is_DNP"]), None)
             if last_played:
                 st.subheader("🕒 Last Game Played (Most Recent Non-DNP)")
@@ -1067,7 +1106,6 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
                     )
                 )
 
-            # Line chart for PTS / REB / AST (excluding DNP)
             try:
                 df_played_chart = df_stats[~df_stats["Is_DNP"]].copy()
                 if not df_played_chart.empty:
@@ -1076,7 +1114,6 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             except Exception:
                 pass
 
-        # Opponent team last 7 results (team-level)
         opp_rows = data.get("opp_results_rows")
         if opp_rows:
             opp_name = data.get("opp_name", "Opponent Team")
@@ -1085,7 +1122,6 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             st.dataframe(df_opp, use_container_width=True)
 
         with st.expander("View Raw Logs & Injuries", expanded=False):
-            # Context header
             st.markdown(f"**Player:** {p_label}")
             st.markdown(f"**Matchup:** {m_label}")
             st.markdown(f"**Date:** {d_label}")
@@ -1101,7 +1137,6 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
         st.write(data.get("analysis", "No analysis"))
 
         st.divider()
-        # Chat
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
@@ -1115,7 +1150,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
                     ctx = data.get("context", "")
                     res = llm.invoke(f"CTX:\n{ctx}\nQ: {val}").content
                     st.markdown(res)
-            st.session_state.messages.append({"role": "assistant", "content": res})
+            st.session_state.messages.append({"role": "assistant", "content": res))
 
 else:
     st.warning("⚠️ Keys missing! Check your secrets.toml or enter them in the sidebar.")
