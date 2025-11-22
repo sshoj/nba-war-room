@@ -7,4 +7,4 @@ requests
 pandas
 pydantic==1.10.13
 numpy<2
-
+langchain-google-genai
