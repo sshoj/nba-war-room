@@ -134,28 +134,39 @@ def get_team_logo_url(team_abbr: str):
 # --- BALLDONTLIE TOOLS ---
 
 def get_player_info_smart(user_input):
-    """Smart player search with typo tolerance."""
+    """
+    Smart player search that prioritizes:
+    1. Name match (fuzzy logic)
+    2. Team match (if user includes 'Hornets', 'CHA', etc.)
+    """
     try:
+        # 1. Gather candidates by searching for every word in the input
+        # (We keep this broad to ensure we catch the player even if the team is typed)
         words = user_input.split()
         candidates = {}
-        search_terms = set(words)
+        search_terms = set()
+        
         for w in words:
             if len(w) >= 3:
-                search_terms.add(w[:3])
+                search_terms.add(w)
+
+        # If input is short (e.g. "Embiid"), ensure we search it
+        if not search_terms and words:
+            search_terms.add(words[0])
 
         for term in search_terms:
             try:
                 r = requests.get(
                     url=f"{BDL_URL}/players",
                     headers=get_bdl_headers(),
-                    params={"search": term, "per_page": 10},
+                    params={"search": term, "per_page": 25}, # Increased page size
                     timeout=REQUEST_TIMEOUT,
                 )
             except Exception as e:
                 return None, f"Network error searching for player: {e}"
 
             if r.status_code != 200:
-                return None, f"Sport stats API error ({r.status_code}) while searching players."
+                return None, f"API Error {r.status_code}"
 
             data = r.json().get("data", [])
             for p in data:
@@ -164,20 +175,51 @@ def get_player_info_smart(user_input):
         if not candidates:
             return None, f"Player '{user_input}' not found."
 
-        candidate_list = list(candidates.values())
-        candidate_names = [f"{c['first_name']} {c['last_name']}" for c in candidate_list]
-        best_matches = difflib.get_close_matches(user_input, candidate_names, n=1, cutoff=0.4)
+        # 2. Score the candidates based on Name Similarity AND Team Match
+        scored_candidates = []
+        user_input_norm = user_input.lower()
+        
+        for pid, p in candidates.items():
+            fname = p.get('first_name', '')
+            lname = p.get('last_name', '')
+            full_name = f"{fname} {lname}"
+            
+            # Team info
+            team = p.get('team', {})
+            t_name = team.get('name', '').lower()       # e.g. hornets
+            t_city = team.get('city', '').lower()       # e.g. charlotte
+            t_abbr = team.get('abbreviation', '').lower() # e.g. cha
+            
+            # A. Calculate Name Score (0.0 to 1.0)
+            # We strip the team name out of user input for the name comparison to be fair
+            # (e.g. compare "Mark Williams" to "Mark Williams", ignoring "Hornets")
+            input_name_only = user_input_norm.replace(t_name, "").replace(t_city, "").replace(t_abbr, "").strip()
+            name_score = difflib.SequenceMatcher(None, input_name_only, full_name.lower()).ratio()
+            
+            # B. Calculate Team Bonus
+            # If the user typed "Hornets", "CHA", or "Charlotte", give a massive bonus
+            team_bonus = 0.0
+            if (t_name in user_input_norm) or (t_city in user_input_norm) or (t_abbr in user_input_norm):
+                team_bonus = 0.3  # huge boost to separate Mark from Marvin
 
-        if best_matches:
-            target_name = best_matches[0]
-            p = next(c for c in candidate_list if f"{c['first_name']} {c['last_name']}" == target_name)
-            return p, f"Found: **{target_name}** (Corrected from '{user_input}')"
+            # Total Score
+            final_score = name_score + team_bonus
+            scored_candidates.append((final_score, p))
 
-        return None, "No close matches found."
+        # 3. Sort by highest score
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        if not scored_candidates:
+             return None, "No close matches found."
+
+        best_match = scored_candidates[0][1]
+        best_name = f"{best_match['first_name']} {best_match['last_name']}"
+        best_team = best_match['team']['full_name']
+        
+        return best_match, f"Found: **{best_name}** ({best_team})"
 
     except Exception as e:
         return None, f"Search Error: {e}"
-
 
 def get_team_injuries(team_id):
     """Fetches official injury report with error handling."""
