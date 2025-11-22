@@ -281,7 +281,73 @@ def get_team_schedule_before_today(team_id, n_games: int = 7):
     except Exception:
         return []
 
+def get_next_game_bdl(team_id, days_ahead: int = 14):
+    """
+    Find the next NON-FINAL game for a team using BallDontLie schedule.
 
+    Returns:
+        (matchup_str, date_str, opp_team_id, opp_team_full_name, opp_team_abbr, game_id)
+        or (None, None, None, None, None, None) if not found.
+    """
+    try:
+        season = get_current_season()
+        today = datetime.now().strftime("%Y-%m-%d")
+        future = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+        resp = requests.get(
+            f"{BDL_URL}/games",
+            headers=get_bdl_headers(),
+            params={
+                "team_ids[]": str(team_id),
+                "seasons[]": str(season),
+                "start_date": today,
+                "end_date": future,
+                "per_page": 50,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None, None, None, None, None, None
+
+        data = resp.json().get("data", [])
+        if not data:
+            return None, None, None, None, None, None
+
+        # Sort upcoming games by date (soonest first)
+        data.sort(key=lambda x: x["date"])
+
+        for g in data:
+            status = g.get("status", "")
+            # Skip games that are already final; allow Scheduled / In Progress / etc.
+            if status == "Final":
+                continue
+
+            home = g.get("home_team", {})
+            visitor = g.get("visitor_team", {})
+
+            if home.get("id") == team_id:
+                loc = "vs"
+                opp = visitor
+            else:
+                loc = "@"
+                opp = home
+
+            matchup_str = f"{loc} {opp.get('full_name', 'Unknown')}"
+            date_str = g.get("date", "").split("T")[0]
+            return (
+                matchup_str,
+                date_str,
+                opp.get("id"),
+                opp.get("full_name"),
+                opp.get("abbreviation"),
+                g.get("id"),
+            )
+
+        return None, None, None, None, None, None
+
+    except Exception:
+        return None, None, None, None, None, None
+        
 def get_stats_for_games(player_id, game_ids):
     """Fetch stats for a player across a list of game IDs with error handling."""
     if not game_ids:
