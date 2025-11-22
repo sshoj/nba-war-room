@@ -252,7 +252,12 @@ def get_stats_for_games(player_id, game_ids):
 
 
 def get_next_game(team_id):
-    """Get the *nearest* upcoming game (today or next) for a team with error handling."""
+    """
+    Get the *nearest* upcoming game for a team:
+    - Looks from today to 14 days ahead.
+    - Skips games with status 'Final'.
+    - Sorts by BDL game date and picks the earliest.
+    """
     try:
         url = f"{BDL_URL}/games"
         today = datetime.now().strftime("%Y-%m-%d")
@@ -277,39 +282,26 @@ def get_next_game(team_id):
         if not data:
             return None, "No games found.", None, None, None
 
-        now_utc = datetime.utcnow()
-        upcoming = []
-
-        for g in data:
-            # Skip games already final
-            if g.get("status") == "Final":
-                continue
-
-            date_str = g.get("date")
-            if not date_str:
-                continue
-
-            try:
-                # Example from BDL: "2024-11-21T00:00:00.000Z"
-                g_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            except Exception:
-                try:
-                    g_dt = datetime.fromisoformat(date_str)
-                except Exception:
-                    continue
-
-            # Skip games that are clearly in the past (in case API still flags as non-final)
-            if g_dt < now_utc - timedelta(hours=6):
-                continue
-
-            upcoming.append((g_dt, g))
+        # Filter out Final; sort by raw date from API
+        upcoming = [g for g in data if g.get("status") != "Final"]
 
         if not upcoming:
             return None, "No upcoming games.", None, None, None
 
-        # Pick the closest in time
-        upcoming.sort(key=lambda x: x[0])
-        game = upcoming[0][1]
+        def parse_game_dt(g):
+            date_str = g.get("date")
+            if not date_str:
+                return datetime.max
+            try:
+                return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            except Exception:
+                try:
+                    return datetime.fromisoformat(date_str)
+                except Exception:
+                    return datetime.max
+
+        upcoming.sort(key=parse_game_dt)
+        game = upcoming[0]
 
         if game["home_team"]["id"] == team_id:
             opp = game["visitor_team"]
@@ -531,7 +523,10 @@ def get_betting_odds(player_name, team_name, bookmakers=None):
     """
     Fetch betting lines with error handling.
 
-    - Uses /events to find the *closest upcoming* game by commence_time.
+    Returns:
+        (odds_text, tipoff_utc_iso_str)
+
+    - Uses /events to find the *closest* game by commence_time for this team.
     - Uses /events/{id}/odds with markets=player_points,player_rebounds,player_assists,h2h.
     - Player props:
         - Taken from a single bookmaker (prefer FanDuel, else first).
@@ -540,7 +535,7 @@ def get_betting_odds(player_name, team_name, bookmakers=None):
     """
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
-        return "Betting API key missing."
+        return "Betting API key missing.", None
 
     try:
         # 1. Get Games list (events)
@@ -555,16 +550,15 @@ def get_betting_odds(player_name, team_name, bookmakers=None):
                 msg = games_resp.json().get("message", games_resp.text)
             except Exception:
                 msg = games_resp.text
-            return f"Error fetching games from Betting API (status {games_resp.status_code}): {msg}"
+            return f"Error fetching games from Betting API (status {games_resp.status_code}): {msg}", None
 
         games = games_resp.json()
         if not isinstance(games, list) or not games:
-            return "No betting lines available."
+            return "No betting lines available.", None
 
         team_name_lower = team_name.lower()
-        now_utc = datetime.utcnow()
 
-        # --- choose the nearest upcoming event for this team ---
+        # --- choose the nearest event for this team by commence_time ---
         best_game = None
         best_time = None
 
@@ -585,18 +579,15 @@ def get_betting_odds(player_name, team_name, bookmakers=None):
             except Exception:
                 continue
 
-            # Skip games that are clearly in the past
-            if g_dt < now_utc - timedelta(hours=6):
-                continue
-
             if best_time is None or g_dt < best_time:
                 best_time = g_dt
                 best_game = g
 
         if not best_game:
-            return f"No active betting lines found for {team_name}."
+            return f"No active betting lines found for {team_name}.", None
 
         game_id = best_game.get("id")
+        tipoff_iso = best_game.get("commence_time")  # Keep raw ISO from API
 
         # 2. Get props + moneyline in ONE call
         params = {
@@ -617,12 +608,12 @@ def get_betting_odds(player_name, team_name, bookmakers=None):
                 msg = odds_resp.json().get("message", odds_resp.text)
             except Exception:
                 msg = odds_resp.text
-            return f"Error fetching odds (status {odds_resp.status_code}): {msg}"
+            return f"Error fetching odds (status {odds_resp.status_code}): {msg}", tipoff_iso
 
         data = odds_resp.json()
         bookmakers_list = data.get("bookmakers", [])
         if not bookmakers_list:
-            return "No odds available."
+            return "No odds available.", tipoff_iso
 
         # --- Player Props from ONE bookmaker (prefer FanDuel, else first) ---
         props_lines = []
@@ -677,12 +668,12 @@ def get_betting_odds(player_name, team_name, bookmakers=None):
             sections.append("**Game Moneyline (All Books):**\n" + "\n".join(moneyline_lines))
 
         if sections:
-            return "\n\n".join(sections)
+            return "\n\n".join(sections), tipoff_iso
 
-        return "No odds available."
+        return "No odds available.", tipoff_iso
 
     except Exception as e:
-        return f"Error fetching odds: {e}"
+        return f"Error fetching odds: {e}", None
 
 # --- CORE ANALYSIS PIPELINE ---
 
@@ -713,9 +704,9 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         if not opp_str:
             opp_name = "Unknown"
 
-        # 3. Betting Odds (props + multi-book moneyline)
+        # 3. Betting Odds (props + multi-book moneyline + tipoff time)
         status_box.write("Checking lines...")
-        betting_lines = get_betting_odds(f"{fname} {lname}", tname)
+        betting_lines, tipoff_iso = get_betting_odds(f"{fname} {lname}", tname)
 
         # 4. Injuries
         status_box.write("Fetching injuries...")
@@ -900,6 +891,7 @@ Rules:
             "rotation_games_used": rotation_games_used,
             "opp_rotation_rows": opp_rotation_rows,
             "opp_rotation_games_used": opp_rotation_games_used,
+            "tipoff_iso": tipoff_iso,
         }
         st.session_state.messages = [{"role": "assistant", "content": analysis}]
         status_box.update(label="Ready!", state="complete", expanded=False)
@@ -944,8 +936,8 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
         home_logo = get_team_logo_url(team_abbr)
         away_logo = get_team_logo_url(opp_abbr)
 
-        # Header: logos + matchup
-        logo_col1, mid_col, logo_col2 = st.columns([1, 2, 1])
+        # Header: logos + matchup + countdown
+        logo_col1, mid_col, logo_col2 = st.columns([1, 3, 1])
         with logo_col1:
             if home_logo:
                 st.image(home_logo, width=80)
@@ -954,6 +946,27 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
         with mid_col:
             st.markdown(f"### 📊 Report: {p_label}  \n**Matchup:** {m_label}")
             st.caption(f"Date: {d_label}")
+
+            # Countdown to tipoff (approx) from Betting API
+            tipoff_iso = data.get("tipoff_iso")
+            if tipoff_iso:
+                try:
+                    tip_dt = datetime.fromisoformat(tipoff_iso.replace("Z", "+00:00"))
+                    tip_dt_naive = tip_dt.replace(tzinfo=None)
+                    now = datetime.utcnow()
+                    delta = tip_dt_naive - now
+                    secs = int(delta.total_seconds())
+                    if secs > 0:
+                        hours, rem = divmod(secs, 3600)
+                        minutes, _ = divmod(rem, 60)
+                        st.metric(
+                            "Time to tipoff (approx)",
+                            f"{hours}h {minutes}m"
+                        )
+                    else:
+                        st.metric("Time to tipoff (approx)", "Tipoff passed")
+                except Exception:
+                    pass
         with logo_col2:
             if away_logo:
                 st.image(away_logo, width=80)
