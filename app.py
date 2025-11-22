@@ -1230,7 +1230,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
     with col2:
         st.write("")
         st.write("")
-        run_btn = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
+        run_btn = st.button("🚀 Run Analysis", type="primary", width="stretch")
 
     if run_btn:
         run_analysis(p_name, llm)
@@ -1370,8 +1370,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             df_rot = pd.DataFrame(rotation_rows)
             if "Player ID" in df_rot.columns:
                 df_rot = df_rot.drop(columns=["Player ID"])
-            st.dataframe(df_rot, use_container_width=True)
-
+            st.dataframe(df_rot, width="stretch")
         opp_rotation_rows = data.get("opp_rotation_rows")
         opp_rotation_games_used = data.get("opp_rotation_games_used", 0)
         if opp_rotation_rows:
@@ -1384,7 +1383,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             df_opp_rot = pd.DataFrame(opp_rotation_rows)
             if "Player ID" in df_opp_rot.columns:
                 df_opp_rot = df_opp_rot.drop(columns=["Player ID"])
-            st.dataframe(df_opp_rot, use_container_width=True)
+            st.dataframe(df_opp_rot, width="stretch")
 
         # Player stats + KPIs
         stats_rows = data.get("stats_rows")
@@ -1411,7 +1410,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
                 pass
 
             st.subheader(f"📜 {p_label} – Game Log (Last Team Games)")
-            st.dataframe(df_stats, use_container_width=True)
+            st.dataframe(df_stats, width="stretch")
 
             last_played = next((row for row in stats_rows if not row["Is_DNP"]), None)
             if last_played:
@@ -1447,7 +1446,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             opp_name = data.get("opp_name", "Opponent Team")
             st.subheader(f"📉 {opp_name} – Recent Results (Last Team Games)")
             df_opp = pd.DataFrame(opp_rows)
-            st.dataframe(df_opp, use_container_width=True)
+            st.dataframe(df_opp, width="stretch")
 
         with st.expander("View Raw Logs & Injuries", expanded=False):
             st.markdown(f"**Player:** {p_label}")
