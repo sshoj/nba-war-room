@@ -348,28 +348,50 @@ def get_next_game_bdl(team_id, days_ahead: int = 14):
     except Exception:
         return None, None, None, None, None, None
         
-def get_stats_for_games(player_id, game_ids):
-    """Fetch stats for a player across a list of game IDs with error handling."""
+def get_player_stats_for_games(player_id, game_ids):
+    """
+    Robust way to get a player's stats for specific games.
+
+    For each game_id:
+      - fetch /stats?game_ids[]=gid&per_page=100
+      - find the row where player.id == player_id
+      - store it in a dict keyed by game_id
+
+    Returns:
+        { game_id: stat_row_dict, ... }
+    """
+    stats_by_game = {}
     if not game_ids:
-        return []
-    try:
-        url = f"{BDL_URL}/stats"
-        params = {
-            "player_ids[]": str(player_id),
-            "per_page": "50",
-            "game_ids[]": [str(g) for g in game_ids],
-        }
-        resp = requests.get(
-            url,
-            headers=get_bdl_headers(),
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            return []
-        return resp.json().get("data", [])
-    except Exception:
-        return []
+        return stats_by_game
+
+    for gid in game_ids:
+        try:
+            resp = requests.get(
+                f"{BDL_URL}/stats",
+                headers=get_bdl_headers(),
+                params={"game_ids[]": str(gid), "per_page": 100},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                continue
+
+            data = resp.json().get("data", [])
+            if not isinstance(data, list):
+                continue
+
+            # Find this player's row in that game
+            for s in data:
+                player = s.get("player") or {}
+                if player.get("id") == player_id:
+                    stats_by_game[gid] = s
+                    break  # done for this game
+
+        except Exception:
+            # If any single game fails, just skip it
+            continue
+
+    return stats_by_game
+
 
 
 def compute_team_form(past_games, team_id):
@@ -1152,64 +1174,65 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         past_games = get_team_schedule_before_today(tid, n_games=7)
         adv_home = compute_team_advanced_stats(tid, past_games)
         gids = [g["id"] for g in past_games]
-        p_stats = get_stats_for_games(pid, gids)
+        stats_by_game = get_player_stats_for_games(pid, gids)
 
         log_lines = []
-        stats_rows = []
+stats_rows = []
 
-        for g in past_games:
-            gid = g["id"]
-            d = g["date"].split("T")[0]
+for g in past_games:
+    gid = g["id"]
+    d = g["date"].split("T")[0]
 
-            home = g.get("home_team", {})
-            visitor = g.get("visitor_team", {})
+    home = g.get("home_team", {})
+    visitor = g.get("visitor_team", {})
 
-            if home.get("id") == tid:
-                opp_abbr_log = visitor.get("abbreviation", "UNK")
-                loc = "vs"
-            else:
-                opp_abbr_log = home.get("abbreviation", "UNK")
-                loc = "@"
+    if home.get("id") == tid:
+        opp_abbr_log = visitor.get("abbreviation", "UNK")
+        loc = "vs"
+    else:
+        opp_abbr_log = home.get("abbreviation", "UNK")
+        loc = "@"
 
-            stat = next((s for s in p_stats if s["game"]["id"] == gid), None)
+    stat = stats_by_game.get(gid)
 
-            # STRICT DNP CHECK
-            min_val_raw = stat.get("min") if stat else None
-            played = bool(
-                min_val_raw
-                and str(min_val_raw) not in ("0", "00:00", "")
-            )
+    # STRICT DNP CHECK
+    min_val_raw = stat.get("min") if stat else None
+    played = bool(
+        min_val_raw
+        and str(min_val_raw) not in ("0", "00:00", "")
+    )
 
-            if played:
-                fg_pct = stat.get("fg_pct")
-                fg = f"{fg_pct * 100:.0f}%" if fg_pct else "0%"
-                fg3m = stat.get("fg3m", 0)
-                fg3a = stat.get("fg3a", 0)
-                fg3 = f"{fg3m}/{fg3a}"
-                line = (
-                    f"MIN:{min_val_raw} | PTS:{stat.get('pts', 0)} "
-                    f"REB:{stat.get('reb', 0)} AST:{stat.get('ast', 0)} | FG:{fg} 3PT:{fg3}"
-                )
-            else:
-                line = "⛔ DNP (Did Not Play)"
+    if played:
+        fg_pct = stat.get("fg_pct")
+        fg = f"{fg_pct * 100:.0f}%" if fg_pct else "0%"
+        fg3m = stat.get("fg3m", 0)
+        fg3a = stat.get("fg3a", 0)
+        fg3 = f"{fg3m}/{fg3a}"
+        line = (
+            f"MIN:{min_val_raw} | PTS:{stat.get('pts', 0)} "
+            f"REB:{stat.get('reb', 0)} AST:{stat.get('ast', 0)} | FG:{fg} 3PT:{fg3}"
+        )
+    else:
+        line = "⛔ DNP (Did Not Play)"
 
-            log_lines.append(f"[{d}] {loc} {opp_abbr_log} | {line}")
+    log_lines.append(f"[{d}] {loc} {opp_abbr_log} | {line}")
 
-            mins_numeric = parse_minutes(min_val_raw) if played else 0
-            stats_rows.append(
-                {
-                    "Date": d,
-                    "Location": loc,
-                    "Opponent": opp_abbr_log,
-                    "MIN": mins_numeric,
-                    "PTS": stat.get("pts", 0) if stat else 0,
-                    "REB": stat.get("reb", 0) if stat else 0,
-                    "AST": stat.get("ast", 0) if stat else 0,
-                    "3PM": stat.get("fg3m", 0) if stat else 0,
-                    "3PA": stat.get("fg3a", 0) if stat else 0,
-                    "Is_DNP": not played,
-                }
-            )
+    mins_numeric = parse_minutes(min_val_raw) if played else 0
+    stats_rows.append(
+        {
+            "Date": d,
+            "Location": loc,
+            "Opponent": opp_abbr_log,
+            "MIN": mins_numeric,
+            "PTS": stat.get("pts", 0) if stat else 0,
+            "REB": stat.get("reb", 0) if stat else 0,
+            "AST": stat.get("ast", 0) if stat else 0,
+            "3PM": stat.get("fg3m", 0) if stat else 0,
+            "3PA": stat.get("fg3a", 0) if stat else 0,
+            "Is_DNP": not played,
+        }
+    )
+
 
         final_log = "\n".join(log_lines)
 
