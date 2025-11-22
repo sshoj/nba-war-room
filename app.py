@@ -368,13 +368,9 @@ def get_next_game_bdl(team_id, days_ahead: int = 14):
         
 def get_player_stats_for_games(player_id, game_ids):
     """
-    Robust way to get a player's stats for specific games.
-
-    For each game_id:
-      - fetch /stats?game_ids[]=gid&per_page=100
-      - find the row where player.id == player_id
-      - store it in a dict keyed by game_id
-
+    Sniper approach:
+      - For each game_id, query the API *directly* for that player+game.
+      - This avoids pagination traps and weird ordering issues.
     Returns:
         { game_id: stat_row_dict, ... }
     """
@@ -382,34 +378,36 @@ def get_player_stats_for_games(player_id, game_ids):
     if not game_ids:
         return stats_by_game
 
+    pid_str = str(player_id)
+
     for gid in game_ids:
+        gid_str = str(gid)
         try:
             resp = requests.get(
                 f"{BDL_URL}/stats",
                 headers=get_bdl_headers(),
-                params={"game_ids[]": str(gid), "per_page": 100},
+                params={
+                    "player_ids[]": pid_str,   # filter by THIS player
+                    "game_ids[]": gid_str,     # and THIS game
+                    "per_page": 1,             # max 1 row needed
+                },
                 timeout=REQUEST_TIMEOUT,
             )
             if resp.status_code != 200:
                 continue
 
             data = resp.json().get("data", [])
-            if not isinstance(data, list):
+            if not isinstance(data, list) or not data:
                 continue
 
-            # Find this player's row in that game
-            for s in data:
-                player = s.get("player") or {}
-                if player.get("id") == player_id:
-                    stats_by_game[gid] = s
-                    break  # done for this game
+            # data[0] is the unique stat row for this player in this game
+            stats_by_game[gid] = data[0]
 
         except Exception:
-            # If any single game fails, just skip it
+            # skip this game if anything goes wrong
             continue
 
     return stats_by_game
-
 
 
 def compute_team_form(past_games, team_id):
