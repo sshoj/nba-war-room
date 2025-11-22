@@ -1150,7 +1150,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
                     ctx = data.get("context", "")
                     res = llm.invoke(f"CTX:\n{ctx}\nQ: {val}").content
                     st.markdown(res)
-            st.session_state.messages.append({"role": "assistant", "content": res))
+            st.session_state.messages.append({"role": "assistant", "content": res})
 
 else:
     st.warning("⚠️ Keys missing! Check your secrets.toml or enter them in the sidebar.")
