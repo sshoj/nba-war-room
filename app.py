@@ -1177,62 +1177,62 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         stats_by_game = get_player_stats_for_games(pid, gids)
 
         log_lines = []
-stats_rows = []
-
-for g in past_games:
-    gid = g["id"]
-    d = g["date"].split("T")[0]
-
-    home = g.get("home_team", {})
-    visitor = g.get("visitor_team", {})
-
-    if home.get("id") == tid:
-        opp_abbr_log = visitor.get("abbreviation", "UNK")
-        loc = "vs"
-    else:
-        opp_abbr_log = home.get("abbreviation", "UNK")
-        loc = "@"
-
-    stat = stats_by_game.get(gid)
-
-    # STRICT DNP CHECK
-    min_val_raw = stat.get("min") if stat else None
-    played = bool(
-        min_val_raw
-        and str(min_val_raw) not in ("0", "00:00", "")
-    )
-
-    if played:
-        fg_pct = stat.get("fg_pct")
-        fg = f"{fg_pct * 100:.0f}%" if fg_pct else "0%"
-        fg3m = stat.get("fg3m", 0)
-        fg3a = stat.get("fg3a", 0)
-        fg3 = f"{fg3m}/{fg3a}"
-        line = (
-            f"MIN:{min_val_raw} | PTS:{stat.get('pts', 0)} "
-            f"REB:{stat.get('reb', 0)} AST:{stat.get('ast', 0)} | FG:{fg} 3PT:{fg3}"
-        )
-    else:
-        line = "⛔ DNP (Did Not Play)"
-
-    log_lines.append(f"[{d}] {loc} {opp_abbr_log} | {line}")
-
-    mins_numeric = parse_minutes(min_val_raw) if played else 0
-    stats_rows.append(
-        {
-            "Date": d,
-            "Location": loc,
-            "Opponent": opp_abbr_log,
-            "MIN": mins_numeric,
-            "PTS": stat.get("pts", 0) if stat else 0,
-            "REB": stat.get("reb", 0) if stat else 0,
-            "AST": stat.get("ast", 0) if stat else 0,
-            "3PM": stat.get("fg3m", 0) if stat else 0,
-            "3PA": stat.get("fg3a", 0) if stat else 0,
-            "Is_DNP": not played,
-        }
-    )
-
+        stats_rows = []
+        
+        for g in past_games:
+            gid = g["id"]
+            d = g["date"].split("T")[0]
+        
+            home = g.get("home_team", {})
+            visitor = g.get("visitor_team", {})
+        
+            if home.get("id") == tid:
+                opp_abbr_log = visitor.get("abbreviation", "UNK")
+                loc = "vs"
+            else:
+                opp_abbr_log = home.get("abbreviation", "UNK")
+                loc = "@"
+        
+            stat = stats_by_game.get(gid)
+        
+            # STRICT DNP CHECK
+            min_val_raw = stat.get("min") if stat else None
+            played = bool(
+                min_val_raw
+                and str(min_val_raw) not in ("0", "00:00", "")
+            )
+        
+            if played:
+                fg_pct = stat.get("fg_pct")
+                fg = f"{fg_pct * 100:.0f}%" if fg_pct else "0%"
+                fg3m = stat.get("fg3m", 0)
+                fg3a = stat.get("fg3a", 0)
+                fg3 = f"{fg3m}/{fg3a}"
+                line = (
+                    f"MIN:{min_val_raw} | PTS:{stat.get('pts', 0)} "
+                    f"REB:{stat.get('reb', 0)} AST:{stat.get('ast', 0)} | FG:{fg} 3PT:{fg3}"
+                )
+            else:
+                line = "⛔ DNP (Did Not Play)"
+        
+            log_lines.append(f"[{d}] {loc} {opp_abbr_log} | {line}")
+        
+            mins_numeric = parse_minutes(min_val_raw) if played else 0
+            stats_rows.append(
+                {
+                    "Date": d,
+                    "Location": loc,
+                    "Opponent": opp_abbr_log,
+                    "MIN": mins_numeric,
+                    "PTS": stat.get("pts", 0) if stat else 0,
+                    "REB": stat.get("reb", 0) if stat else 0,
+                    "AST": stat.get("ast", 0) if stat else 0,
+                    "3PM": stat.get("fg3m", 0) if stat else 0,
+                    "3PA": stat.get("fg3a", 0) if stat else 0,
+                    "Is_DNP": not played,
+                }
+            )
+        
 
         final_log = "\n".join(log_lines)
 
