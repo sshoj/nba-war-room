@@ -1075,7 +1075,33 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         tabbr = player_obj["team"]["abbreviation"]
         st.success(msg)
 
-        # 2. Betting Game (canonical next game) + Odds
+        # 2. Next game from BallDontLie (primary schedule source)
+        status_box.write("Finding next scheduled game...")
+        matchup = "Unknown matchup"
+        game_date_display = "Unknown date"
+        opp_id = None
+        opp_name_bdl = "Unknown opponent"
+        opp_abbr = ""
+
+        (
+            bdl_matchup,
+            bdl_date,
+            bdl_opp_id,
+            bdl_opp_name,
+            bdl_opp_abbr,
+            _,
+        ) = get_next_game_bdl(tid, days_ahead=14)
+
+        if bdl_matchup and bdl_date and bdl_opp_id:
+            matchup = bdl_matchup
+            game_date_display = bdl_date
+            opp_id = bdl_opp_id
+            if bdl_opp_name:
+                opp_name_bdl = bdl_opp_name
+            if bdl_opp_abbr:
+                opp_abbr = bdl_opp_abbr
+
+        # 3. Betting Game + Odds (may or may not align perfectly with BDL)
         status_box.write("Finding betting event & lines...")
         betting = get_betting_game_and_odds(f"{fname} {lname}", tname)
         betting_lines = betting["odds_text"]
@@ -1083,40 +1109,38 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         odds_home = betting["home_team"]
         odds_away = betting["away_team"]
 
-        # Derive matchup + date from Odds event
-        matchup = "Unknown matchup"
-        game_date_display = "Unknown date"
-        opp_name = "Unknown opponent"
-
-        if odds_home and odds_away:
+        # If BDL couldn't find next game, try to infer matchup from Betting API
+        if matchup == "Unknown matchup" and odds_home and odds_away:
             norm_team = normalize_team_name(tname)
             home_norm = normalize_team_name(odds_home)
             away_norm = normalize_team_name(odds_away)
 
             if norm_team in home_norm:
-                opp_name = odds_away
+                opp_guess = odds_away
                 loc = "vs"
             elif norm_team in away_norm:
-                opp_name = odds_home
+                opp_guess = odds_home
                 loc = "@"
             else:
-                opp_name = odds_away
+                opp_guess = odds_away
                 loc = "vs"
 
-            matchup = f"{loc} {opp_name}"
+            matchup = f"{loc} {opp_guess}"
 
-        if tipoff_iso:
+            # Map guessed opponent into BDL if we still don't have opp_id
+            if not opp_id:
+                opp_team_bdl = get_bdl_team_by_name(opp_guess)
+                opp_id = opp_team_bdl.get("id")
+                opp_abbr = opp_team_bdl.get("abbreviation", opp_abbr)
+                opp_name_bdl = opp_team_bdl.get("full_name", opp_guess)
+
+        # If Betting API has tipoff time and BDL didn't give a date, use betting date
+        if tipoff_iso and game_date_display == "Unknown date":
             try:
                 tip_dt = datetime.fromisoformat(tipoff_iso.replace("Z", "+00:00"))
                 game_date_display = tip_dt.date().isoformat()
             except Exception:
                 pass
-
-        # 3. Get opponent team info from BDL (for injuries, stats, rotation)
-        opp_team_bdl = get_bdl_team_by_name(opp_name)
-        opp_id = opp_team_bdl.get("id")
-        opp_abbr = opp_team_bdl.get("abbreviation", "")
-        opp_name_bdl = opp_team_bdl.get("full_name", opp_name)
 
         # 4. Injuries
         status_box.write("Fetching injuries...")
@@ -1312,7 +1336,6 @@ Rules:
     except Exception as e:
         status_box.update(label="System Error", state="error")
         st.error(f"Error: {e}")
-
 
 # --- MAIN APP ENTRY ---
 
