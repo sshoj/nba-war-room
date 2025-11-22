@@ -758,11 +758,16 @@ def get_team_rotation(team_id, n_games: int = 7):
 
 # --- BETTING API TOOLS (NOW CANONICAL FOR NEXT GAME) ---
 
-from datetime import datetime, timezone
-
 def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bool = False):
     """
     Canonical source of the upcoming game for this player/team.
+
+    Flow:
+      1) Use /odds with markets=h2h (featured markets only) to:
+         - Find the correct event for the team
+         - Get all moneyline prices from all books
+      2) Use /events/{eventId}/odds with player_* markets to:
+         - Get player props for that specific event
 
     Returns dict:
     {
@@ -782,34 +787,35 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bo
         }
 
     try:
-        # 1) Get events WITH odds using the canonical /odds endpoint
-        #    (this is what the docs recommend for live/upcoming games)
-        games_resp = requests.get(
-            "https://api.the-odds-api.com/v4/sports/basketball_nba/odds",
+        # --- 1) GET GAME LINES (FEATURED MARKETS ONLY) ---
+        # /odds only supports featured markets like h2h, spreads, totals.
+        # Player props here would cause INVALID_MARKET (422).
+        odds_resp = requests.get(
+            f"{ODDS_URL}/odds",
             params={
                 "apiKey": api_key,
-                "regions": "us",  # you can adjust region(s) if desired
-                "markets": "h2h,player_points,player_rebounds,player_assists",
+                "regions": "us",         # adjust if you want multiple regions
+                "markets": "h2h",        # moneyline only here to avoid 422
                 "dateFormat": "iso",
             },
             timeout=REQUEST_TIMEOUT,
         )
 
-        if games_resp.status_code != 200:
+        if odds_resp.status_code != 200:
             try:
-                msg = games_resp.json().get("message", games_resp.text)
+                msg = odds_resp.json().get("message", odds_resp.text)
             except Exception:
-                msg = games_resp.text
+                msg = odds_resp.text
             return {
-                "odds_text": f"Error fetching games from Betting API (status {games_resp.status_code}): {msg}",
+                "odds_text": f"Error fetching games from Betting API (status {odds_resp.status_code}): {msg}",
                 "tipoff_iso": None,
                 "home_team": None,
                 "away_team": None,
             }
 
-        games = games_resp.json()
+        games = odds_resp.json()
         if debug:
-            st.write("DEBUG – Raw Odds Events:", games)
+            st.write("DEBUG – /odds events:", games)
 
         if not isinstance(games, list) or not games:
             return {
@@ -827,7 +833,7 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bo
 
         now_utc = datetime.now(timezone.utc)
 
-        # --- pass 1: find the nearest FUTURE event for this team ---
+        # --- pick the nearest future event (or closest overall as fallback) ---
         for g in games:
             ht = g.get("home_team") or ""
             at = g.get("away_team") or ""
@@ -839,28 +845,25 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bo
             if not ct:
                 continue
 
-            # Make sure commence_time is always timezone-aware UTC
             try:
                 dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
             except Exception:
-                # If it still fails, skip this event
                 continue
+
             if dt.tzinfo is None:
-                # treat as UTC if tz is missing
                 dt = dt.replace(tzinfo=timezone.utc)
 
-            # For future game selection
+            # Future game for that team
             if dt >= now_utc:
                 if best_future_time is None or dt < best_future_time:
                     best_future_time = dt
                     best_future_game = g
 
-            # Track closest event in time (future OR past) as fallback
+            # Closest event regardless of past/future
             if closest_any_time is None or abs((dt - now_utc).total_seconds()) < abs((closest_any_time - now_utc).total_seconds()):
                 closest_any_time = dt
                 closest_any_game = g
 
-        # Prefer future game, else fallback to closest
         selected_game = best_future_game or closest_any_game
         tipoff_dt = best_future_time or closest_any_time
 
@@ -877,43 +880,10 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bo
         home_team = selected_game.get("home_team")
         away_team = selected_game.get("away_team")
 
-        # --- 2) Extract odds from THIS event (we already have odds in the /odds response) ---
-        # games from /odds already contain bookmaker odds, so we don't need a second call
+        # --- game moneyline from ALL bookmakers (already in /odds response) ---
         bookmakers_list = selected_game.get("bookmakers", [])
-        if not bookmakers_list:
-            return {
-                "odds_text": "No odds available.",
-                "tipoff_iso": tipoff_iso,
-                "home_team": home_team,
-                "away_team": away_team,
-            }
-
-        # Player props from preferred book
-        props_lines = []
-        props_bookmaker_title = None
-        preferred_key = "fanduel"
-        props_bookmaker = next(
-            (b for b in bookmakers_list if b.get("key") == preferred_key),
-            bookmakers_list[0],
-        )
-
-        if props_bookmaker:
-            props_bookmaker_title = props_bookmaker.get("title") or props_bookmaker.get("key", "Book")
-            p_last = player_name.split()[-1].lower()
-            for market in props_bookmaker.get("markets", []):
-                mkey = market.get("key", "")
-                if not mkey.startswith("player_"):
-                    continue
-                market_name = mkey.replace("player_", "").title()
-                for outcome in market.get("outcomes", []):
-                    desc = outcome.get("description", "")
-                    if p_last in desc.lower():
-                        line = outcome.get("point", "N/A")
-                        price = outcome.get("price", "N/A")
-                        props_lines.append(f"**{market_name}**: {line} ({price})")
-
-        # Moneyline from ALL books
         moneyline_lines = []
+
         for b in bookmakers_list:
             b_title = b.get("title") or b.get("key", "Book")
             h2h_market = next(
@@ -925,14 +895,73 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bo
             outcomes = h2h_market.get("outcomes", [])
             if len(outcomes) < 2:
                 continue
-            parts = [f"{o.get('name', 'Team')} ({o.get('price', 'N/A')})" for o in outcomes]
+
+            parts = [
+                f"{o.get('name', 'Team')} ({o.get('price', 'N/A')})"
+                for o in outcomes
+            ]
             ml_str = " vs ".join(parts)
             moneyline_lines.append(f"- **{b_title}**: {ml_str}")
 
+        # --- 2) PLAYER PROPS VIA /events/{id}/odds (non-featured markets allowed here) ---
+        props_lines = []
+        props_bookmaker_title = None
+
+        try:
+            props_params = {
+                "apiKey": api_key,
+                "regions": "us",
+                "markets": "player_points,player_rebounds,player_assists",
+                "dateFormat": "iso",
+            }
+            if bookmakers:
+                props_params["bookmakers"] = bookmakers
+
+            props_resp = requests.get(
+                f"{ODDS_URL}/events/{game_id}/odds",
+                params=props_params,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if props_resp.status_code == 200:
+                props_data = props_resp.json()
+                props_books = props_data.get("bookmakers", [])
+
+                # Prefer FanDuel if available
+                preferred_key = "fanduel"
+                props_bookmaker = next(
+                    (b for b in props_books if b.get("key") == preferred_key),
+                    props_books[0] if props_books else None,
+                )
+
+                if props_bookmaker:
+                    props_bookmaker_title = props_bookmaker.get("title") or props_bookmaker.get("key", "Book")
+                    p_last = player_name.split()[-1].lower()
+
+                    for market in props_bookmaker.get("markets", []):
+                        mkey = market.get("key", "")
+                        if not mkey.startswith("player_"):
+                            continue
+                        market_name = mkey.replace("player_", "").title()
+                        for outcome in market.get("outcomes", []):
+                            desc = outcome.get("description", "")
+                            if p_last in desc.lower():
+                                line = outcome.get("point", "N/A")
+                                price = outcome.get("price", "N/A")
+                                props_lines.append(f"**{market_name}**: {line} ({price})")
+
+            # If 404 / 422 / etc on props, we just skip props and keep moneyline
+        except Exception:
+            # Silently ignore props errors; we still have game odds
+            pass
+
+        # --- build final text ---
         sections = []
+
         if props_lines:
             label = f"**Player Props ({props_bookmaker_title})**" if props_bookmaker_title else "**Player Props**"
             sections.append(label + ":\n" + " | ".join(props_lines))
+
         if moneyline_lines:
             sections.append("**Game Moneyline (All Books):**\n" + "\n".join(moneyline_lines))
 
@@ -954,6 +983,7 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bo
             "home_team": None,
             "away_team": None,
         }
+
 
 
 # --- CORE ANALYSIS PIPELINE ---
