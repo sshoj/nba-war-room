@@ -255,29 +255,47 @@ def get_team_injuries(team_id):
 
 
 def get_team_schedule_before_today(team_id, n_games: int = 7):
-    """Fetch team's last n finished games (extended history) with error handling."""
+    """
+    Fetch the team's last n finished games.
+
+    - Pulls from BOTH the current season and the previous season.
+    - Filters to games with status == "Final".
+    - Sorts by date descending and returns the most recent n games.
+    """
     try:
-        url = f"{BDL_URL}/games"
-        today = datetime.now().strftime("%Y-%m-%d")
-        season = get_current_season()
-        params = {
-            "team_ids[]": str(team_id),
-            "seasons[]": str(season),
-            "end_date": today,
-            "per_page": "50",
-        }
-        resp = requests.get(
-            url,
-            headers=get_bdl_headers(),
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        current_season = get_current_season()
+        seasons_to_check = [current_season, current_season - 1]
+
+        all_games = []
+
+        for season in seasons_to_check:
+            resp = requests.get(
+                f"{BDL_URL}/games",
+                headers=get_bdl_headers(),
+                params={
+                    "team_ids[]": str(team_id),
+                    "seasons[]": str(season),
+                    "end_date": today_str,
+                    "per_page": 100,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                continue
+
+            data = resp.json().get("data", [])
+            if isinstance(data, list):
+                all_games.extend(data)
+
+        if not all_games:
             return []
-        data = resp.json().get("data", [])
-        finished = [g for g in data if g.get("status") == "Final"]
+
+        finished = [g for g in all_games if g.get("status") == "Final"]
         finished.sort(key=lambda x: x["date"], reverse=True)
+
         return finished[:n_games]
+
     except Exception:
         return []
 
