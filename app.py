@@ -758,7 +758,9 @@ def get_team_rotation(team_id, n_games: int = 7):
 
 # --- BETTING API TOOLS (NOW CANONICAL FOR NEXT GAME) ---
 
-def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
+from datetime import datetime, timezone
+
+def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bool = False):
     """
     Canonical source of the upcoming game for this player/team.
 
@@ -780,9 +782,16 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
         }
 
     try:
+        # 1) Get events WITH odds using the canonical /odds endpoint
+        #    (this is what the docs recommend for live/upcoming games)
         games_resp = requests.get(
-            f"{ODDS_URL}/events",
-            params={"apiKey": api_key},
+            "https://api.the-odds-api.com/v4/sports/basketball_nba/odds",
+            params={
+                "apiKey": api_key,
+                "regions": "us",  # you can adjust region(s) if desired
+                "markets": "h2h,player_points,player_rebounds,player_assists",
+                "dateFormat": "iso",
+            },
             timeout=REQUEST_TIMEOUT,
         )
 
@@ -799,6 +808,9 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
             }
 
         games = games_resp.json()
+        if debug:
+            st.write("DEBUG – Raw Odds Events:", games)
+
         if not isinstance(games, list) or not games:
             return {
                 "odds_text": "No betting lines available.",
@@ -808,52 +820,51 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
             }
 
         team_norm = normalize_team_name(team_name)
-        # Pick nearest future event where team_name matches home or away
-        best_game = None
-        best_time = None
+        best_future_game = None
+        best_future_time = None
+        closest_any_game = None
+        closest_any_time = None
 
-        now = datetime.now(timezone.utc)
+        now_utc = datetime.now(timezone.utc)
 
+        # --- pass 1: find the nearest FUTURE event for this team ---
         for g in games:
             ht = g.get("home_team") or ""
             at = g.get("away_team") or ""
+
             if team_norm not in normalize_team_name(ht) and team_norm not in normalize_team_name(at):
                 continue
 
             ct = g.get("commence_time")
             if not ct:
                 continue
+
+            # Make sure commence_time is always timezone-aware UTC
             try:
-                g_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
             except Exception:
+                # If it still fails, skip this event
                 continue
+            if dt.tzinfo is None:
+                # treat as UTC if tz is missing
+                dt = dt.replace(tzinfo=timezone.utc)
 
-            if g_dt < now:
-                continue
+            # For future game selection
+            if dt >= now_utc:
+                if best_future_time is None or dt < best_future_time:
+                    best_future_time = dt
+                    best_future_game = g
 
-            if best_time is None or g_dt < best_time:
-                best_time = g_dt
-                best_game = g
+            # Track closest event in time (future OR past) as fallback
+            if closest_any_time is None or abs((dt - now_utc).total_seconds()) < abs((closest_any_time - now_utc).total_seconds()):
+                closest_any_time = dt
+                closest_any_game = g
 
-        # If nothing in future, fallback to ANY match (closest in time)
-        if not best_game:
-            for g in games:
-                ht = g.get("home_team") or ""
-                at = g.get("away_team") or ""
-                if team_norm not in normalize_team_name(ht) and team_norm not in normalize_team_name(at):
-                    continue
-                ct = g.get("commence_time")
-                if not ct:
-                    continue
-                try:
-                    g_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
-                except Exception:
-                    continue
-                if best_time is None or g_dt < best_time:
-                    best_time = g_dt
-                    best_game = g
+        # Prefer future game, else fallback to closest
+        selected_game = best_future_game or closest_any_game
+        tipoff_dt = best_future_time or closest_any_time
 
-        if not best_game:
+        if not selected_game:
             return {
                 "odds_text": f"No active betting lines found for {team_name}.",
                 "tipoff_iso": None,
@@ -861,39 +872,14 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
                 "away_team": None,
             }
 
-        game_id = best_game.get("id")
-        tipoff_iso = best_game.get("commence_time")
-        home_team = best_game.get("home_team")
-        away_team = best_game.get("away_team")
+        game_id = selected_game.get("id")
+        tipoff_iso = tipoff_dt.isoformat() if tipoff_dt else selected_game.get("commence_time")
+        home_team = selected_game.get("home_team")
+        away_team = selected_game.get("away_team")
 
-        # 2. Odds for that exact event
-        params = {
-            "apiKey": api_key,
-            "regions": "us",
-            "markets": "player_points,player_rebounds,player_assists,h2h",
-        }
-        if bookmakers:
-            params["bookmakers"] = bookmakers
-
-        odds_resp = requests.get(
-            f"{ODDS_URL}/events/{game_id}/odds",
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if odds_resp.status_code != 200:
-            try:
-                msg = odds_resp.json().get("message", odds_resp.text)
-            except Exception:
-                msg = odds_resp.text
-            return {
-                "odds_text": f"Error fetching odds (status {odds_resp.status_code}): {msg}",
-                "tipoff_iso": tipoff_iso,
-                "home_team": home_team,
-                "away_team": away_team,
-            }
-
-        data = odds_resp.json()
-        bookmakers_list = data.get("bookmakers", [])
+        # --- 2) Extract odds from THIS event (we already have odds in the /odds response) ---
+        # games from /odds already contain bookmaker odds, so we don't need a second call
+        bookmakers_list = selected_game.get("bookmakers", [])
         if not bookmakers_list:
             return {
                 "odds_text": "No odds available.",
@@ -926,7 +912,7 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
                         price = outcome.get("price", "N/A")
                         props_lines.append(f"**{market_name}**: {line} ({price})")
 
-        # Moneyline from all books
+        # Moneyline from ALL books
         moneyline_lines = []
         for b in bookmakers_list:
             b_title = b.get("title") or b.get("key", "Book")
