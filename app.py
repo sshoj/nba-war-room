@@ -390,7 +390,7 @@ def get_player_stats_for_games(player_id, game_ids):
                 params={
                     "player_ids[]": pid_str,     # filter by THIS player
                     "game_ids[]": gid_str,       # and THIS game
-                    "seasons[]": season,         # be explicit about season
+                                                 # be explicit about season
                     "per_page": 1,               # only need one row
                 },
                 timeout=REQUEST_TIMEOUT,
