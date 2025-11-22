@@ -3,7 +3,7 @@ import requests
 from langchain_openai import ChatOpenAI
 import os
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone  # <--- Added timezone import
 import difflib
 
 # --- PAGE CONFIGURATION ---
@@ -535,7 +535,8 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
         best_game = None
         best_time = None
 
-        now = datetime.utcnow()
+        # FIX: Make 'now' timezone-aware (UTC) to match API response
+        now = datetime.now(timezone.utc)
 
         for g in games:
             ht = g.get("home_team") or ""
@@ -547,6 +548,7 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
             if not ct:
                 continue
             try:
+                # ISO Format usually has Z or offset, making it aware.
                 g_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
             except Exception:
                 continue
@@ -999,7 +1001,8 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             if tipoff_iso:
                 try:
                     tip_dt = datetime.fromisoformat(tipoff_iso.replace("Z", "+00:00"))
-                    now = datetime.utcnow()
+                    # FIX: Make 'now' aware (UTC) to avoid comparison errors
+                    now = datetime.now(timezone.utc)
                     delta = tip_dt - now
                     secs = int(delta.total_seconds())
                     if secs > 0:
