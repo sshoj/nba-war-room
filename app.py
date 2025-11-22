@@ -1385,7 +1385,7 @@ Rules:
 
 if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
 
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.5, api_key=api_keys["openai"])
+    llm = ChatOpenAI(model="gpt-4.1", temperature=0.5, api_key=api_keys["openai"])
 
     col1, col2 = st.columns([3, 1])
     with col1:
