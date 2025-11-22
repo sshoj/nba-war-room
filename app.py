@@ -1075,7 +1075,6 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bo
 
 
 # --- CORE ANALYSIS PIPELINE ---
-
 def run_analysis(player_input: str, llm: ChatOpenAI):
     """Execute the full pipeline once user hits the Run button."""
     status_box = st.status("🔍 Scouting in progress...", expanded=True)
@@ -1175,35 +1174,33 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         adv_home = compute_team_advanced_stats(tid, past_games)
         gids = [g["id"] for g in past_games]
         stats_by_game = get_player_stats_for_games(pid, gids)
-        st.write("DEBUG – past_games IDs:", gids)
-        st.write("DEBUG – stats_by_game keys:", list(stats_by_game.keys()))
 
         log_lines = []
         stats_rows = []
-        
+
         for g in past_games:
             gid = g["id"]
             d = g["date"].split("T")[0]
-        
+
             home = g.get("home_team", {})
             visitor = g.get("visitor_team", {})
-        
+
             if home.get("id") == tid:
                 opp_abbr_log = visitor.get("abbreviation", "UNK")
                 loc = "vs"
             else:
                 opp_abbr_log = home.get("abbreviation", "UNK")
                 loc = "@"
-        
+
             stat = stats_by_game.get(gid)
-        
+
             # STRICT DNP CHECK
             min_val_raw = stat.get("min") if stat else None
             played = bool(
                 min_val_raw
                 and str(min_val_raw) not in ("0", "00:00", "")
             )
-        
+
             if played:
                 fg_pct = stat.get("fg_pct")
                 fg = f"{fg_pct * 100:.0f}%" if fg_pct else "0%"
@@ -1216,9 +1213,9 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
                 )
             else:
                 line = "⛔ DNP (Did Not Play)"
-        
+
             log_lines.append(f"[{d}] {loc} {opp_abbr_log} | {line}")
-        
+
             mins_numeric = parse_minutes(min_val_raw) if played else 0
             stats_rows.append(
                 {
@@ -1234,7 +1231,6 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
                     "Is_DNP": not played,
                 }
             )
-        
 
         final_log = "\n".join(log_lines)
 
@@ -1361,6 +1357,7 @@ Rules:
     except Exception as e:
         status_box.update(label="System Error", state="error")
         st.error(f"Error: {e}")
+
 
 # --- MAIN APP ENTRY ---
 
