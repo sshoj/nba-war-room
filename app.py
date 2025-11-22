@@ -3,7 +3,7 @@ import requests
 from langchain_openai import ChatOpenAI
 import os
 import pandas as pd
-from datetime import datetime, timedelta, timezone  # <--- Added timezone import
+from datetime import datetime, timedelta, timezone  # <--- timezone import
 import difflib
 
 # --- PAGE CONFIGURATION ---
@@ -136,44 +136,40 @@ def get_team_logo_url(team_abbr: str):
 def get_player_info_smart(user_input):
     """
     Smart player search:
-    1. Tries exact phrase search first (Fixes 'Mark Williams' -> 'Alan Williams').
+    1. Tries exact phrase search first.
     2. If that fails, splits words to find partial matches.
-    3. Prioritizes players on the requested team (if provided).
+    3. Scores candidates by name and team matches.
     """
     try:
         candidates = {}
         
-        # --- STRATEGY 1: EXACT PHRASE SEARCH (High Priority) ---
-        # This fixes the "Mark Williams" vs "Alan Williams" issue
-        # We strip common team identifiers to help the API find the name
+        # Strip common team identifiers
         clean_input = user_input.lower()
         for ignore in [" hornets", " cha", " charlotte", " suns", " phx", " lakers", " lal"]:
             clean_input = clean_input.replace(ignore, "")
         clean_input = clean_input.strip()
 
-        # Search 1: Send the cleaned full name (e.g. "mark williams")
         queries = [clean_input]
         
-        # Search 2: If the user typed "Williams Mark", flip it
+        # Flip "Last First" -> "First Last"
         if " " in clean_input:
             queries.append(" ".join(clean_input.split()[::-1]))
 
-        # Search 3: Fallback - search individual words if the name is unique (e.g. "Wembanyama")
+        # Also search individual words
         if len(clean_input.split()) > 1:
             queries.extend(clean_input.split())
 
         found_any = False
         
         for q in queries:
-            # Don't search short junk words (e.g. "the")
-            if len(q) < 3: 
+            if len(q) < 3:
                 continue
                 
             try:
                 r = requests.get(
                     url=f"{BDL_URL}/players",
                     headers=get_bdl_headers(),
-                    params={"search": q, "per_page": 100}, # Fetch more to bury bad matches
+                    params={"search": q, "per_page": 100},
                     timeout=REQUEST_TIMEOUT,
                 )
                 if r.status_code == 200:
@@ -184,14 +180,12 @@ def get_player_info_smart(user_input):
             except Exception:
                 pass
             
-            # If we found exact matches in the first pass, stop looking to avoid pollution
             if found_any and q == clean_input:
                 break
 
         if not candidates:
             return None, f"Player '{user_input}' not found."
 
-        # --- SCORING SYSTEM ---
         candidate_list = list(candidates.values())
         scored_results = []
         
@@ -203,31 +197,23 @@ def get_player_info_smart(user_input):
             lname = p['last_name'].lower()
             full_name = f"{fname} {lname}"
             
-            # Team Info
             team_name = p['team']['full_name'].lower()
             team_abbr = p['team']['abbreviation'].lower()
 
-            # 1. Name Similarity (0-100 points)
-            # We compare the player name against the 'clean' input (name only)
+            # 1. Name similarity (0-100)
             sim = difflib.SequenceMatcher(None, clean_input, full_name).ratio()
             score += sim * 100
 
-            # 2. Exact Name Bonus (+50 points)
-            # This ensures "Mark Williams" beats "Alan Williams"
+            # 2. Exact name bonus
             if clean_input == full_name:
                 score += 50
             
-            # 3. Team Match Bonus (+30 points)
-            # If user typed "Hornets" and player is on Hornets
+            # 3. Team match bonus
             if any(t in user_input.lower() for t in [team_name, team_abbr]):
                 score += 30
 
-            # 4. ID Penalty (Optional logic: lower IDs are often older/retired players in some DBs)
-            # But relying on score is safer.
-            
             scored_results.append((score, p))
 
-        # Sort by score descending
         scored_results.sort(key=lambda x: x[0], reverse=True)
         
         best_match = scored_results[0][1]
@@ -238,6 +224,7 @@ def get_player_info_smart(user_input):
 
     except Exception as e:
         return None, f"Search Error: {e}"
+
 
 def get_team_injuries(team_id):
     """Fetches official injury report with error handling."""
@@ -359,6 +346,236 @@ def compute_team_form(past_games, team_id):
     pa = pa_total / games_counted
     net = pf - pa
     return {"pf": pf, "pa": pa, "net": net, "wins": wins, "losses": losses, "games_used": games_counted}
+
+
+def compute_team_advanced_stats(team_id, games):
+    """
+    Compute advanced team metrics over a window of games.
+
+    Inputs:
+        team_id: int (BallDontLie team id)
+        games:   list of game dicts (e.g. from get_team_schedule_before_today)
+
+    Returns dict:
+        {
+          "games_used": int,
+          "off_rtg": float,    # Off Rtg (points per 100 poss)
+          "def_rtg": float,    # Def Rtg (points allowed per 100 poss)
+          "net_rtg": float,    # Off - Def
+          "pace": float,       # possessions per game (approx)
+
+          "fg_pct": float,     # FG%
+          "two_pct": float,    # 2P%
+          "three_pct": float,  # 3P%
+          "three_pa_rate": float,  # 3PA / FGA
+          "ft_pct": float,     # FT%
+          "ftr": float,        # FTA / FGA
+
+          "orb_pct": float,    # offensive rebounding %
+          "drb_pct": float,    # defensive rebounding %
+          "reb_pg": float,     # total rebounds per game
+
+          "tov_pg": float,     # turnovers per game
+          "tov_pct": float,    # turnovers per possession
+        }
+    """
+    empty = {
+        "games_used": 0,
+        "off_rtg": 0.0,
+        "def_rtg": 0.0,
+        "net_rtg": 0.0,
+        "pace": 0.0,
+        "fg_pct": 0.0,
+        "two_pct": 0.0,
+        "three_pct": 0.0,
+        "three_pa_rate": 0.0,
+        "ft_pct": 0.0,
+        "ftr": 0.0,
+        "orb_pct": 0.0,
+        "drb_pct": 0.0,
+        "reb_pg": 0.0,
+        "tov_pg": 0.0,
+        "tov_pct": 0.0,
+    }
+
+    if not games:
+        return empty
+
+    game_ids = [g.get("id") for g in games if g.get("id") is not None]
+    if not game_ids:
+        return empty
+
+    # --- fetch ALL stats rows for these games (paginate) ---
+    all_stats = []
+    try:
+        page = 1
+        while True:
+            params = {
+                "game_ids[]": [str(gid) for gid in game_ids],
+                "per_page": 100,
+                "page": page,
+            }
+            resp = requests.get(
+                f"{BDL_URL}/stats",
+                headers=get_bdl_headers(),
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                break
+            batch = resp.json().get("data", [])
+            if not batch:
+                break
+            all_stats.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+    except Exception:
+        all_stats = []
+
+    if not all_stats:
+        return empty
+
+    # --- aggregate per game: team vs opponent ---
+    per_game = {}
+    for s in all_stats:
+        game = s.get("game") or {}
+        gid = game.get("id")
+        if gid not in game_ids:
+            continue
+
+        t = s.get("team") or {}
+        side = "team" if t.get("id") == team_id else "opp"
+
+        if gid not in per_game:
+            per_game[gid] = {
+                "team": {
+                    "pts": 0, "fgm": 0, "fga": 0,
+                    "fg3m": 0, "fg3a": 0,
+                    "ftm": 0, "fta": 0,
+                    "oreb": 0, "dreb": 0, "reb": 0,
+                    "tov": 0,
+                },
+                "opp": {
+                    "pts": 0, "fgm": 0, "fga": 0,
+                    "fg3m": 0, "fg3a": 0,
+                    "ftm": 0, "fta": 0,
+                    "oreb": 0, "dreb": 0, "reb": 0,
+                    "tov": 0,
+                },
+            }
+
+        bucket = per_game[gid][side]
+        bucket["pts"] += s.get("pts", 0)
+        bucket["fgm"] += s.get("fgm", 0)
+        bucket["fga"] += s.get("fga", 0)
+        bucket["fg3m"] += s.get("fg3m", 0)
+        bucket["fg3a"] += s.get("fg3a", 0)
+        bucket["ftm"] += s.get("ftm", 0)
+        bucket["fta"] += s.get("fta", 0)
+        bucket["oreb"] += s.get("oreb", 0)
+        bucket["dreb"] += s.get("dreb", 0)
+        bucket["reb"] += s.get("reb", 0)
+        bucket["tov"] += s.get("turnover", 0)
+
+    # --- accumulate over games ---
+    games_used = 0
+    tot_team_pts = tot_opp_pts = 0.0
+    tot_team_poss = tot_opp_poss = 0.0
+
+    tot_fgm = tot_fga = 0.0
+    tot_fg3m = tot_fg3a = 0.0
+    tot_ftm = tot_fta = 0.0
+    tot_oreb = tot_dreb = tot_reb = 0.0
+    tot_opp_oreb = tot_opp_dreb = 0.0
+    tot_tov = 0.0
+
+    for gid in game_ids:
+        rec = per_game.get(gid)
+        if not rec:
+            continue
+        team = rec["team"]
+        opp = rec["opp"]
+
+        team_poss = (
+            team["fga"]
+            - team["oreb"]
+            + team["tov"]
+            + 0.44 * team["fta"]
+        )
+        opp_poss = (
+            opp["fga"]
+            - opp["oreb"]
+            + opp["tov"]
+            + 0.44 * opp["fta"]
+        )
+
+        tot_team_pts += team["pts"]
+        tot_opp_pts += opp["pts"]
+        tot_team_poss += team_poss
+        tot_opp_poss += opp_poss
+
+        tot_fgm += team["fgm"]
+        tot_fga += team["fga"]
+        tot_fg3m += team["fg3m"]
+        tot_fg3a += team["fg3a"]
+        tot_ftm += team["ftm"]
+        tot_fta += team["fta"]
+        tot_oreb += team["oreb"]
+        tot_dreb += team["dreb"]
+        tot_reb += team["reb"]
+        tot_opp_oreb += opp["oreb"]
+        tot_opp_dreb += opp["dreb"]
+        tot_tov += team["tov"]
+
+        games_used += 1
+
+    if games_used == 0 or tot_team_poss <= 0:
+        return empty
+
+    off_rtg = 100.0 * tot_team_pts / tot_team_poss
+    def_rtg = 100.0 * tot_opp_pts / tot_team_poss
+    net_rtg = off_rtg - def_rtg
+
+    pace = (tot_team_poss + tot_opp_poss) / (2.0 * games_used)
+
+    fg_pct = tot_fgm / tot_fga if tot_fga > 0 else 0.0
+    two_fgm = tot_fgm - tot_fg3m
+    two_fga = tot_fga - tot_fg3a
+    two_pct = two_fgm / two_fga if two_fga > 0 else 0.0
+    three_pct = tot_fg3m / tot_fg3a if tot_fg3a > 0 else 0.0
+    three_pa_rate = tot_fg3a / tot_fga if tot_fga > 0 else 0.0
+
+    ft_pct = tot_ftm / tot_fta if tot_fta > 0 else 0.0
+    ftr = tot_fta / tot_fga if tot_fga > 0 else 0.0
+
+    orb_den = tot_oreb + tot_opp_dreb
+    drb_den = tot_dreb + tot_opp_oreb
+    orb_pct = tot_oreb / orb_den if orb_den > 0 else 0.0
+    drb_pct = tot_dreb / drb_den if drb_den > 0 else 0.0
+    reb_pg = tot_reb / games_used
+
+    tov_pg = tot_tov / games_used
+    tov_pct = tot_tov / tot_team_poss if tot_team_poss > 0 else 0.0
+
+    return {
+        "games_used": games_used,
+        "off_rtg": off_rtg,
+        "def_rtg": def_rtg,
+        "net_rtg": net_rtg,
+        "pace": pace,
+        "fg_pct": fg_pct,
+        "two_pct": two_pct,
+        "three_pct": three_pct,
+        "three_pa_rate": three_pa_rate,
+        "ft_pct": ft_pct,
+        "ftr": ftr,
+        "orb_pct": orb_pct,
+        "drb_pct": drb_pct,
+        "reb_pg": reb_pg,
+        "tov_pg": tov_pg,
+        "tov_pct": tov_pct,
+    }
 
 
 def get_team_players(team_id):
@@ -595,7 +812,6 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
         best_game = None
         best_time = None
 
-        # FIX: Make 'now' timezone-aware (UTC) to match API response
         now = datetime.now(timezone.utc)
 
         for g in games:
@@ -608,14 +824,11 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None):
             if not ct:
                 continue
             try:
-                # ISO Format usually has Z or offset, making it aware.
                 g_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
             except Exception:
                 continue
 
             if g_dt < now:
-                # game already started / past – still could be relevant for props,
-                # but for "upcoming game" UX we favor future or nearest-time.
                 continue
 
             if best_time is None or g_dt < best_time:
@@ -805,7 +1018,6 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
                 opp_name = odds_home
                 loc = "@"
             else:
-                # fallback: assume home team is player's team
                 opp_name = odds_away
                 loc = "vs"
 
@@ -832,6 +1044,7 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         # 5. Home Team Stats (Last 7 Games + Strict DNP)
         status_box.write("Crunching stats...")
         past_games = get_team_schedule_before_today(tid, n_games=7)
+        adv_home = compute_team_advanced_stats(tid, past_games)
         gids = [g["id"] for g in past_games]
         p_stats = get_stats_for_games(pid, gids)
 
@@ -894,10 +1107,13 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
 
         final_log = "\n".join(log_lines)
 
-        # 6. Opponent team's last 7 results (from BDL)
+        # 6. Opponent team's last 7 results (from BDL) + advanced stats
         opp_results_rows = []
+        opp_past_games = []
+        adv_opp = {}
         if opp_id:
             opp_past_games = get_team_schedule_before_today(opp_id, n_games=7)
+            adv_opp = compute_team_advanced_stats(opp_id, opp_past_games)
             for g in opp_past_games:
                 d = g["date"].split("T")[0]
                 home = g.get("home_team", {})
@@ -1004,6 +1220,8 @@ Rules:
             "opp_rotation_rows": opp_rotation_rows,
             "opp_rotation_games_used": opp_rotation_games_used,
             "tipoff_iso": tipoff_iso,
+            "adv_home": adv_home,
+            "adv_opp": adv_opp,
         }
         st.session_state.messages = [{"role": "assistant", "content": analysis}]
         status_box.update(label="Ready!", state="complete", expanded=False)
@@ -1061,7 +1279,6 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             if tipoff_iso:
                 try:
                     tip_dt = datetime.fromisoformat(tipoff_iso.replace("Z", "+00:00"))
-                    # FIX: Make 'now' aware (UTC) to avoid comparison errors
                     now = datetime.now(timezone.utc)
                     delta = tip_dt - now
                     secs = int(delta.total_seconds())
@@ -1092,6 +1309,68 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
             c2.metric("Defense (PA)", f"{team_form.get('pa', 0):.1f} PPG")
             c3.metric("Net Rating (approx)", f"{team_form.get('net', 0):+.1f}")
             c4.metric("Record", f"{team_form.get('wins', 0)}–{team_form.get('losses', 0)}")
+
+        # Advanced team metrics (home + opponent)
+        adv_home = data.get("adv_home") or {}
+        adv_opp = data.get("adv_opp") or {}
+
+        if (adv_home and adv_home.get("games_used", 0) > 0) or (adv_opp and adv_opp.get("games_used", 0) > 0):
+            st.subheader("📊 Advanced Team Metrics (Recent Games)")
+            col_home, col_opp = st.columns(2)
+
+            if adv_home and adv_home.get("games_used", 0) > 0:
+                with col_home:
+                    st.markdown(f"**{data.get('team_name', 'Home Team')}**  \n_Games: {adv_home.get('games_used', 0)}_")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Off Rtg", f"{adv_home.get('off_rtg', 0):.1f}")
+                    m2.metric("Def Rtg", f"{adv_home.get('def_rtg', 0):.1f}")
+                    m3.metric("Net Rtg", f"{adv_home.get('net_rtg', 0):+.1f}")
+
+                    m4, m5, m6 = st.columns(3)
+                    m4.metric("Pace", f"{adv_home.get('pace', 0):.1f}")
+                    m5.metric("FG%", f"{adv_home.get('fg_pct', 0)*100:.1f}%")
+                    m6.metric("3P%", f"{adv_home.get('three_pct', 0)*100:.1f}%")
+
+                    m7, m8, m9 = st.columns(3)
+                    m7.metric("FT%", f"{adv_home.get('ft_pct', 0)*100:.1f}%")
+                    m8.metric("3PA Rate", f"{adv_home.get('three_pa_rate', 0):.2f}")
+                    m9.metric("FTr", f"{adv_home.get('ftr', 0):.2f}")
+
+                    m10, m11, m12 = st.columns(3)
+                    m10.metric("ORB%", f"{adv_home.get('orb_pct', 0)*100:.1f}%")
+                    m11.metric("DRB%", f"{adv_home.get('drb_pct', 0)*100:.1f}%")
+                    m12.metric("REB/G", f"{adv_home.get('reb_pg', 0):.1f}")
+
+                    m13, m14 = st.columns(2)
+                    m13.metric("TOV/G", f"{adv_home.get('tov_pg', 0):.1f}")
+                    m14.metric("TOV%", f"{adv_home.get('tov_pct', 0)*100:.1f}%")
+
+            if adv_opp and adv_opp.get("games_used", 0) > 0:
+                with col_opp:
+                    st.markdown(f"**{data.get('opp_name', 'Opponent Team')}**  \n_Games: {adv_opp.get('games_used', 0)}_")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Off Rtg", f"{adv_opp.get('off_rtg', 0):.1f}")
+                    m2.metric("Def Rtg", f"{adv_opp.get('def_rtg', 0):.1f}")
+                    m3.metric("Net Rtg", f"{adv_opp.get('net_rtg', 0):+.1f}")
+
+                    m4, m5, m6 = st.columns(3)
+                    m4.metric("Pace", f"{adv_opp.get('pace', 0):.1f}")
+                    m5.metric("FG%", f"{adv_opp.get('fg_pct', 0)*100:.1f}%")
+                    m6.metric("3P%", f"{adv_opp.get('three_pct', 0)*100:.1f}%")
+
+                    m7, m8, m9 = st.columns(3)
+                    m7.metric("FT%", f"{adv_opp.get('ft_pct', 0)*100:.1f}%")
+                    m8.metric("3PA Rate", f"{adv_opp.get('three_pa_rate', 0):.2f}")
+                    m9.metric("FTr", f"{adv_opp.get('ftr', 0):.2f}")
+
+                    m10, m11, m12 = st.columns(3)
+                    m10.metric("ORB%", f"{adv_opp.get('orb_pct', 0)*100:.1f}%")
+                    m11.metric("DRB%", f"{adv_opp.get('drb_pct', 0)*100:.1f}%")
+                    m12.metric("REB/G", f"{adv_opp.get('reb_pg', 0):.1f}")
+
+                    m13, m14 = st.columns(2)
+                    m13.metric("TOV/G", f"{adv_opp.get('tov_pg', 0):.1f}")
+                    m14.metric("TOV%", f"{adv_opp.get('tov_pct', 0)*100:.1f}%")
 
         # Rotations
         rotation_rows = data.get("rotation_rows")
