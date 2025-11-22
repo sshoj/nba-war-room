@@ -1175,6 +1175,8 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         adv_home = compute_team_advanced_stats(tid, past_games)
         gids = [g["id"] for g in past_games]
         stats_by_game = get_player_stats_for_games(pid, gids)
+        st.write("DEBUG – past_games IDs:", gids)
+        st.write("DEBUG – stats_by_game keys:", list(stats_by_game.keys()))
 
         log_lines = []
         stats_rows = []
