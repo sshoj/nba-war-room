@@ -379,6 +379,7 @@ def get_player_stats_for_games(player_id, game_ids):
         return stats_by_game
 
     pid_str = str(player_id)
+    season = str(get_current_season())
 
     for gid in game_ids:
         gid_str = str(gid)
@@ -387,9 +388,10 @@ def get_player_stats_for_games(player_id, game_ids):
                 f"{BDL_URL}/stats",
                 headers=get_bdl_headers(),
                 params={
-                    "player_ids[]": pid_str,   # filter by THIS player
-                    "game_ids[]": gid_str,     # and THIS game
-                    "per_page": 1,             # max 1 row needed
+                    "player_ids[]": pid_str,     # filter by THIS player
+                    "game_ids[]": gid_str,       # and THIS game
+                    "seasons[]": season,         # be explicit about season
+                    "per_page": 1,               # only need one row
                 },
                 timeout=REQUEST_TIMEOUT,
             )
@@ -400,14 +402,15 @@ def get_player_stats_for_games(player_id, game_ids):
             if not isinstance(data, list) or not data:
                 continue
 
-            # data[0] is the unique stat row for this player in this game
+            # unique row for this player/game
             stats_by_game[gid] = data[0]
 
         except Exception:
-            # skip this game if anything goes wrong
+            # skip this game on error
             continue
 
     return stats_by_game
+
 
 
 def compute_team_form(past_games, team_id):
