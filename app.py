@@ -135,88 +135,106 @@ def get_team_logo_url(team_abbr: str):
 
 def get_player_info_smart(user_input):
     """
-    Smart player search that prioritizes:
-    1. Name match (fuzzy logic)
-    2. Team match (if user includes 'Hornets', 'CHA', etc.)
+    Smart player search:
+    1. Tries exact phrase search first (Fixes 'Mark Williams' -> 'Alan Williams').
+    2. If that fails, splits words to find partial matches.
+    3. Prioritizes players on the requested team (if provided).
     """
     try:
-        # 1. Gather candidates by searching for every word in the input
-        # (We keep this broad to ensure we catch the player even if the team is typed)
-        words = user_input.split()
         candidates = {}
-        search_terms = set()
         
-        for w in words:
-            if len(w) >= 3:
-                search_terms.add(w)
+        # --- STRATEGY 1: EXACT PHRASE SEARCH (High Priority) ---
+        # This fixes the "Mark Williams" vs "Alan Williams" issue
+        # We strip common team identifiers to help the API find the name
+        clean_input = user_input.lower()
+        for ignore in [" hornets", " cha", " charlotte", " suns", " phx", " lakers", " lal"]:
+            clean_input = clean_input.replace(ignore, "")
+        clean_input = clean_input.strip()
 
-        # If input is short (e.g. "Embiid"), ensure we search it
-        if not search_terms and words:
-            search_terms.add(words[0])
+        # Search 1: Send the cleaned full name (e.g. "mark williams")
+        queries = [clean_input]
+        
+        # Search 2: If the user typed "Williams Mark", flip it
+        if " " in clean_input:
+            queries.append(" ".join(clean_input.split()[::-1]))
 
-        for term in search_terms:
+        # Search 3: Fallback - search individual words if the name is unique (e.g. "Wembanyama")
+        if len(clean_input.split()) > 1:
+            queries.extend(clean_input.split())
+
+        found_any = False
+        
+        for q in queries:
+            # Don't search short junk words (e.g. "the")
+            if len(q) < 3: 
+                continue
+                
             try:
                 r = requests.get(
                     url=f"{BDL_URL}/players",
                     headers=get_bdl_headers(),
-                    params={"search": term, "per_page": 25}, # Increased page size
+                    params={"search": q, "per_page": 100}, # Fetch more to bury bad matches
                     timeout=REQUEST_TIMEOUT,
                 )
-            except Exception as e:
-                return None, f"Network error searching for player: {e}"
-
-            if r.status_code != 200:
-                return None, f"API Error {r.status_code}"
-
-            data = r.json().get("data", [])
-            for p in data:
-                candidates[p["id"]] = p
+                if r.status_code == 200:
+                    data = r.json().get("data", [])
+                    for p in data:
+                        candidates[p["id"]] = p
+                        found_any = True
+            except Exception:
+                pass
+            
+            # If we found exact matches in the first pass, stop looking to avoid pollution
+            if found_any and q == clean_input:
+                break
 
         if not candidates:
             return None, f"Player '{user_input}' not found."
 
-        # 2. Score the candidates based on Name Similarity AND Team Match
-        scored_candidates = []
-        user_input_norm = user_input.lower()
+        # --- SCORING SYSTEM ---
+        candidate_list = list(candidates.values())
+        scored_results = []
         
-        for pid, p in candidates.items():
-            fname = p.get('first_name', '')
-            lname = p.get('last_name', '')
+        user_words = user_input.lower().split()
+
+        for p in candidate_list:
+            score = 0
+            fname = p['first_name'].lower()
+            lname = p['last_name'].lower()
             full_name = f"{fname} {lname}"
             
-            # Team info
-            team = p.get('team', {})
-            t_name = team.get('name', '').lower()       # e.g. hornets
-            t_city = team.get('city', '').lower()       # e.g. charlotte
-            t_abbr = team.get('abbreviation', '').lower() # e.g. cha
+            # Team Info
+            team_name = p['team']['full_name'].lower()
+            team_abbr = p['team']['abbreviation'].lower()
+
+            # 1. Name Similarity (0-100 points)
+            # We compare the player name against the 'clean' input (name only)
+            sim = difflib.SequenceMatcher(None, clean_input, full_name).ratio()
+            score += sim * 100
+
+            # 2. Exact Name Bonus (+50 points)
+            # This ensures "Mark Williams" beats "Alan Williams"
+            if clean_input == full_name:
+                score += 50
             
-            # A. Calculate Name Score (0.0 to 1.0)
-            # We strip the team name out of user input for the name comparison to be fair
-            # (e.g. compare "Mark Williams" to "Mark Williams", ignoring "Hornets")
-            input_name_only = user_input_norm.replace(t_name, "").replace(t_city, "").replace(t_abbr, "").strip()
-            name_score = difflib.SequenceMatcher(None, input_name_only, full_name.lower()).ratio()
+            # 3. Team Match Bonus (+30 points)
+            # If user typed "Hornets" and player is on Hornets
+            if any(t in user_input.lower() for t in [team_name, team_abbr]):
+                score += 30
+
+            # 4. ID Penalty (Optional logic: lower IDs are often older/retired players in some DBs)
+            # But relying on score is safer.
             
-            # B. Calculate Team Bonus
-            # If the user typed "Hornets", "CHA", or "Charlotte", give a massive bonus
-            team_bonus = 0.0
-            if (t_name in user_input_norm) or (t_city in user_input_norm) or (t_abbr in user_input_norm):
-                team_bonus = 0.3  # huge boost to separate Mark from Marvin
+            scored_results.append((score, p))
 
-            # Total Score
-            final_score = name_score + team_bonus
-            scored_candidates.append((final_score, p))
-
-        # 3. Sort by highest score
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
-
-        if not scored_candidates:
-             return None, "No close matches found."
-
-        best_match = scored_candidates[0][1]
-        best_name = f"{best_match['first_name']} {best_match['last_name']}"
-        best_team = best_match['team']['full_name']
+        # Sort by score descending
+        scored_results.sort(key=lambda x: x[0], reverse=True)
         
-        return best_match, f"Found: **{best_name}** ({best_team})"
+        best_match = scored_results[0][1]
+        best_p_name = f"{best_match['first_name']} {best_match['last_name']}"
+        best_p_team = best_match['team']['full_name']
+
+        return best_match, f"Found: **{best_p_name}** ({best_p_team})"
 
     except Exception as e:
         return None, f"Search Error: {e}"
