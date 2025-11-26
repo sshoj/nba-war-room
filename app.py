@@ -370,16 +370,15 @@ def get_player_stats_for_games(player_id, game_ids):
     """
     Sniper approach:
       - For each game_id, query the API *directly* for that player+game.
-      - This avoids pagination traps and weird ordering issues.
-    Returns:
-        { game_id: stat_row_dict, ... }
+      - FIXED: Removed 'seasons[]' parameter. The Game ID is unique enough. 
+        Adding season filters blocks data if the game was in the previous season.
     """
     stats_by_game = {}
     if not game_ids:
         return stats_by_game
 
     pid_str = str(player_id)
-    season = str(get_current_season())
+    # Removed season variable definition to avoid the bug
 
     for gid in game_ids:
         gid_str = str(gid)
@@ -390,8 +389,8 @@ def get_player_stats_for_games(player_id, game_ids):
                 params={
                     "player_ids[]": pid_str,     # filter by THIS player
                     "game_ids[]": gid_str,       # and THIS game
-                                                 # be explicit about season
-                    "per_page": 1,               # only need one row
+                    # "seasons[]": season,       # <--- DELETED THIS LINE
+                    "per_page": 100,             
                 },
                 timeout=REQUEST_TIMEOUT,
             )
@@ -402,11 +401,15 @@ def get_player_stats_for_games(player_id, game_ids):
             if not isinstance(data, list) or not data:
                 continue
 
-            # unique row for this player/game
-            stats_by_game[gid] = data[0]
+            # Find the stat row that actually matches our player ID (Double verification)
+            # The API usually respects the filter, but we verify just to be safe.
+            for s in data:
+                # BallDontLie returns player ID as integer, we compare as string to be safe
+                if str(s.get("player", {}).get("id")) == pid_str:
+                    stats_by_game[gid] = s
+                    break
 
         except Exception:
-            # skip this game on error
             continue
 
     return stats_by_game
