@@ -275,7 +275,7 @@ def get_team_schedule_before_today(team_id, n_games: int = 7):
                 headers=get_bdl_headers(),
                 params={
                     "team_ids[]": str(team_id),
-                    "seasons[]": str(season),
+                    #"seasons[]": str(season),
                     "end_date": today_str,
                     "per_page": 100,
                 },
