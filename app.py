@@ -3,7 +3,7 @@ import requests
 from langchain_openai import ChatOpenAI
 import os
 import pandas as pd
-from datetime import datetime, timedelta, timezone  # <--- timezone import
+from datetime import datetime, timedelta, timezone
 import difflib
 
 # --- PAGE CONFIGURATION ---
@@ -257,14 +257,11 @@ def get_team_injuries(team_id):
 def get_team_schedule_before_today(team_id, n_games: int = 7):
     """
     Fetch the team's last n finished games.
-
-    - Pulls from BOTH the current season and the previous season.
-    - Filters to games with status == "Final".
-    - Sorts by date descending and returns the most recent n games.
     """
     try:
         today_str = datetime.now().strftime("%Y-%m-%d")
         current_season = get_current_season()
+        # Pull from both current and previous season to handle early season edge cases
         seasons_to_check = [current_season, current_season - 1]
 
         all_games = []
@@ -275,7 +272,7 @@ def get_team_schedule_before_today(team_id, n_games: int = 7):
                 headers=get_bdl_headers(),
                 params={
                     "team_ids[]": str(team_id),
-                    #"seasons[]": str(season),
+                    "seasons[]": str(season),
                     "end_date": today_str,
                     "per_page": 100,
                 },
@@ -302,10 +299,6 @@ def get_team_schedule_before_today(team_id, n_games: int = 7):
 def get_next_game_bdl(team_id, days_ahead: int = 14):
     """
     Find the next NON-FINAL game for a team using BallDontLie schedule.
-
-    Returns:
-        (matchup_str, date_str, opp_team_id, opp_team_full_name, opp_team_abbr, game_id)
-        or (None, None, None, None, None, None) if not found.
     """
     try:
         season = get_current_season()
@@ -317,7 +310,7 @@ def get_next_game_bdl(team_id, days_ahead: int = 14):
             headers=get_bdl_headers(),
             params={
                 "team_ids[]": str(team_id),
-                #"seasons[]": str(season),
+                "seasons[]": str(season),
                 "start_date": today,
                 "end_date": future,
                 "per_page": 50,
@@ -370,15 +363,13 @@ def get_player_stats_for_games(player_id, game_ids):
     """
     Sniper approach:
       - For each game_id, query the API *directly* for that player+game.
-      - FIXED: Removed 'seasons[]' parameter. The Game ID is unique enough. 
-        Adding season filters blocks data if the game was in the previous season.
+      - Removes seasons parameter to avoid bugs.
     """
     stats_by_game = {}
     if not game_ids:
         return stats_by_game
 
     pid_str = str(player_id)
-    # Removed season variable definition to avoid the bug
 
     for gid in game_ids:
         gid_str = str(gid)
@@ -389,7 +380,6 @@ def get_player_stats_for_games(player_id, game_ids):
                 params={
                     "player_ids[]": pid_str,     # filter by THIS player
                     "game_ids[]": gid_str,       # and THIS game
-                    # "seasons[]": season,       # <--- DELETED THIS LINE
                     "per_page": 100,             
                 },
                 timeout=REQUEST_TIMEOUT,
@@ -402,7 +392,6 @@ def get_player_stats_for_games(player_id, game_ids):
                 continue
 
             # Find the stat row that actually matches our player ID (Double verification)
-            # The API usually respects the filter, but we verify just to be safe.
             for s in data:
                 # BallDontLie returns player ID as integer, we compare as string to be safe
                 if str(s.get("player", {}).get("id")) == pid_str:
@@ -461,51 +450,12 @@ def compute_team_form(past_games, team_id):
 def compute_team_advanced_stats(team_id, games):
     """
     Compute advanced team metrics over a window of games.
-
-    Inputs:
-        team_id: int (BallDontLie team id)
-        games:   list of game dicts (e.g. from get_team_schedule_before_today)
-
-    Returns dict:
-        {
-          "games_used": int,
-          "off_rtg": float,    # Off Rtg (points per 100 poss)
-          "def_rtg": float,    # Def Rtg (points allowed per 100 poss)
-          "net_rtg": float,    # Off - Def
-          "pace": float,       # possessions per game (approx)
-
-          "fg_pct": float,     # FG%
-          "two_pct": float,    # 2P%
-          "three_pct": float,  # 3P%
-          "three_pa_rate": float,  # 3PA / FGA
-          "ft_pct": float,     # FT%
-          "ftr": float,        # FTA / FGA
-
-          "orb_pct": float,    # offensive rebounding %
-          "drb_pct": float,    # defensive rebounding %
-          "reb_pg": float,     # total rebounds per game
-
-          "tov_pg": float,     # turnovers per game
-          "tov_pct": float,    # turnovers per possession
-        }
     """
     empty = {
-        "games_used": 0,
-        "off_rtg": 0.0,
-        "def_rtg": 0.0,
-        "net_rtg": 0.0,
-        "pace": 0.0,
-        "fg_pct": 0.0,
-        "two_pct": 0.0,
-        "three_pct": 0.0,
-        "three_pa_rate": 0.0,
-        "ft_pct": 0.0,
-        "ftr": 0.0,
-        "orb_pct": 0.0,
-        "drb_pct": 0.0,
-        "reb_pg": 0.0,
-        "tov_pg": 0.0,
-        "tov_pct": 0.0,
+        "games_used": 0, "off_rtg": 0.0, "def_rtg": 0.0, "net_rtg": 0.0, "pace": 0.0,
+        "fg_pct": 0.0, "two_pct": 0.0, "three_pct": 0.0, "three_pa_rate": 0.0,
+        "ft_pct": 0.0, "ftr": 0.0, "orb_pct": 0.0, "drb_pct": 0.0, "reb_pg": 0.0,
+        "tov_pg": 0.0, "tov_pct": 0.0,
     }
 
     if not games:
@@ -560,33 +510,28 @@ def compute_team_advanced_stats(team_id, games):
         if gid not in per_game:
             per_game[gid] = {
                 "team": {
-                    "pts": 0, "fgm": 0, "fga": 0,
-                    "fg3m": 0, "fg3a": 0,
-                    "ftm": 0, "fta": 0,
-                    "oreb": 0, "dreb": 0, "reb": 0,
-                    "tov": 0,
+                    "pts": 0, "fgm": 0, "fga": 0, "fg3m": 0, "fg3a": 0,
+                    "ftm": 0, "fta": 0, "oreb": 0, "dreb": 0, "reb": 0, "tov": 0,
                 },
                 "opp": {
-                    "pts": 0, "fgm": 0, "fga": 0,
-                    "fg3m": 0, "fg3a": 0,
-                    "ftm": 0, "fta": 0,
-                    "oreb": 0, "dreb": 0, "reb": 0,
-                    "tov": 0,
+                    "pts": 0, "fgm": 0, "fga": 0, "fg3m": 0, "fg3a": 0,
+                    "ftm": 0, "fta": 0, "oreb": 0, "dreb": 0, "reb": 0, "tov": 0,
                 },
             }
 
+        # FIX: Use (value or 0) to handle NoneTypes safely
         bucket = per_game[gid][side]
-        bucket["pts"] += s.get("pts", 0)
-        bucket["fgm"] += s.get("fgm", 0)
-        bucket["fga"] += s.get("fga", 0)
-        bucket["fg3m"] += s.get("fg3m", 0)
-        bucket["fg3a"] += s.get("fg3a", 0)
-        bucket["ftm"] += s.get("ftm", 0)
-        bucket["fta"] += s.get("fta", 0)
-        bucket["oreb"] += s.get("oreb", 0)
-        bucket["dreb"] += s.get("dreb", 0)
-        bucket["reb"] += s.get("reb", 0)
-        bucket["tov"] += s.get("turnover", 0)
+        bucket["pts"] += (s.get("pts") or 0)
+        bucket["fgm"] += (s.get("fgm") or 0)
+        bucket["fga"] += (s.get("fga") or 0)
+        bucket["fg3m"] += (s.get("fg3m") or 0)
+        bucket["fg3a"] += (s.get("fg3a") or 0)
+        bucket["ftm"] += (s.get("ftm") or 0)
+        bucket["fta"] += (s.get("fta") or 0)
+        bucket["oreb"] += (s.get("oreb") or 0)
+        bucket["dreb"] += (s.get("dreb") or 0)
+        bucket["reb"] += (s.get("reb") or 0)
+        bucket["tov"] += (s.get("turnover") or 0)
 
     # --- accumulate over games ---
     games_used = 0
@@ -795,10 +740,12 @@ def get_team_rotation(team_id, n_games: int = 7):
             }
 
         min_val = parse_minutes(s.get("min"))
-        pts = s.get("pts", 0)
-        reb = s.get("reb", 0)
-        ast = s.get("ast", 0)
-        fg3m = s.get("fg3m", 0)
+        
+        # FIX: Use (val or 0) for stats to avoid += NoneType errors
+        pts = (s.get("pts") or 0)
+        reb = (s.get("reb") or 0)
+        ast = (s.get("ast") or 0)
+        fg3m = (s.get("fg3m") or 0)
 
         if pid not in per_player:
             per_player[pid] = {
@@ -871,21 +818,6 @@ def get_team_rotation(team_id, n_games: int = 7):
 def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bool = False):
     """
     Canonical source of the upcoming game for this player/team.
-
-    Flow:
-      1) Use /odds with markets=h2h (featured markets only) to:
-         - Find the correct event for the team
-         - Get all moneyline prices from all books
-      2) Use /events/{eventId}/odds with player_* markets to:
-         - Get player props for that specific event
-
-    Returns dict:
-    {
-      "odds_text": str,
-      "tipoff_iso": str or None,
-      "home_team": str or None,
-      "away_team": str or None,
-    }
     """
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
@@ -898,14 +830,12 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bo
 
     try:
         # --- 1) GET GAME LINES (FEATURED MARKETS ONLY) ---
-        # /odds only supports featured markets like h2h, spreads, totals.
-        # Player props here would cause INVALID_MARKET (422).
         odds_resp = requests.get(
             f"{ODDS_URL}/odds",
             params={
                 "apiKey": api_key,
-                "regions": "us",         # adjust if you want multiple regions
-                "markets": "h2h",        # moneyline only here to avoid 422
+                "regions": "us",
+                "markets": "h2h",
                 "dateFormat": "iso",
             },
             timeout=REQUEST_TIMEOUT,
@@ -924,9 +854,6 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bo
             }
 
         games = odds_resp.json()
-        if debug:
-            st.write("DEBUG – /odds events:", games)
-
         if not isinstance(games, list) or not games:
             return {
                 "odds_text": "No betting lines available.",
@@ -1060,9 +987,7 @@ def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bo
                                 price = outcome.get("price", "N/A")
                                 props_lines.append(f"**{market_name}**: {line} ({price})")
 
-            # If 404 / 422 / etc on props, we just skip props and keep moneyline
         except Exception:
-            # Silently ignore props errors; we still have game odds
             pass
 
         # --- build final text ---
@@ -1196,10 +1121,7 @@ def run_analysis(player_input: str, llm: ChatOpenAI):
         adv_home = compute_team_advanced_stats(tid, past_games)
         gids = [g["id"] for g in past_games]
         stats_by_game = get_player_stats_for_games(pid, gids)
-        st.write("DEBUG game ids:", gids)
-        st.write("DEBUG stats found for games:", list(stats_by_game.keys()))
-
-
+        
         log_lines = []
         stats_rows = []
 
@@ -1472,7 +1394,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
 
             if adv_home and adv_home.get("games_used", 0) > 0:
                 with col_home:
-                    st.markdown(f"**{data.get('team_name', 'Home Team')}**  \n_Games: {adv_home.get('games_used', 0)}_")
+                    st.markdown(f"**{data.get('team_name', 'Home Team')}** \n_Games: {adv_home.get('games_used', 0)}_")
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Off Rtg", f"{adv_home.get('off_rtg', 0):.1f}")
                     m2.metric("Def Rtg", f"{adv_home.get('def_rtg', 0):.1f}")
@@ -1499,7 +1421,7 @@ if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
 
             if adv_opp and adv_opp.get("games_used", 0) > 0:
                 with col_opp:
-                    st.markdown(f"**{data.get('opp_name', 'Opponent Team')}**  \n_Games: {adv_opp.get('games_used', 0)}_")
+                    st.markdown(f"**{data.get('opp_name', 'Opponent Team')}** \n_Games: {adv_opp.get('games_used', 0)}_")
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Off Rtg", f"{adv_opp.get('off_rtg', 0):.1f}")
                     m2.metric("Def Rtg", f"{adv_opp.get('def_rtg', 0):.1f}")
