@@ -317,7 +317,7 @@ def get_next_game_bdl(team_id, days_ahead: int = 14):
             headers=get_bdl_headers(),
             params={
                 "team_ids[]": str(team_id),
-                "seasons[]": str(season),
+                #"seasons[]": str(season),
                 "start_date": today,
                 "end_date": future,
                 "per_page": 50,
