@@ -4,17 +4,17 @@ from langchain_openai import ChatOpenAI
 import os
 import pandas as pd
 from datetime import datetime, timedelta, timezone
-import difflib
+import time
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="NBA War Room (Ultimate)", page_icon="🏀", layout="wide")
 st.title("🏀 NBA War Room (Ultimate Edition)")
-st.markdown("Use Multi Agent AI NBA betting application Written by Saeed Hojabr")
+st.markdown("Use Multi Agent AI NBA betting application")
 
 # --- CONSTANTS & CONFIG ---
 BDL_URL = "https://api.balldontlie.io/v1"
 ODDS_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba"
-REQUEST_TIMEOUT = 10  # seconds
+REQUEST_TIMEOUT = 15
 
 # --- SESSION STATE SETUP ---
 if "messages" not in st.session_state:
@@ -24,1548 +24,402 @@ if "analysis_data" not in st.session_state:
 
 # --- SECURE AUTHENTICATION ---
 def load_keys():
-    """Load keys from Streamlit secrets or sidebar inputs."""
     keys = {}
-
-    def get_key(secret_name: str, label: str):
+    def get_key(secret_name, label):
         if secret_name in st.secrets:
-            st.sidebar.success(f"✅ {label} Key Loaded")
             return st.secrets[secret_name]
-        else:
-            return st.sidebar.text_input(f"{label} Key", type="password")
+        return st.sidebar.text_input(f"{label} Key", type="password")
 
-    # Generic labels (no provider names)
     keys["bdl"] = get_key("BDL_API_KEY", "Sport Stats API")
     keys["odds"] = get_key("ODDS_API_KEY", "Betting API")
     keys["openai"] = get_key("OPENAI_API_KEY", "AI API")
 
-    if keys["bdl"]:
-        os.environ["BDL_API_KEY"] = keys["bdl"].strip()
-    if keys["odds"]:
-        os.environ["ODDS_API_KEY"] = keys["odds"].strip()
-    if keys["openai"]:
-        os.environ["OPENAI_API_KEY"] = keys["openai"].strip()
-
+    if keys["bdl"]: os.environ["BDL_API_KEY"] = keys["bdl"].strip()
+    if keys["odds"]: os.environ["ODDS_API_KEY"] = keys["odds"].strip()
+    if keys["openai"]: os.environ["OPENAI_API_KEY"] = keys["openai"].strip()
     return keys
 
 with st.sidebar:
     st.header("⚙️ Settings")
     api_keys = load_keys()
-
     st.divider()
     if st.button("New Search / Clear"):
         st.session_state.analysis_data = None
         st.session_state.messages = []
         st.rerun()
 
-# --- BASIC HELPERS ---
-
+# --- HELPERS ---
 def get_bdl_headers():
-    """Return headers for BallDontLie requests (no Bearer prefix)."""
     key = os.environ.get("BDL_API_KEY")
-    if not key:
-        return {}
-    return {"Authorization": key}
-
+    return {"Authorization": key} if key else {}
 
 def get_current_season() -> int:
-    """
-    Compute current NBA season year (year the season starts).
-    If month >= October, season is this year, else previous year.
-    """
     today = datetime.today()
+    # If it's late in the year, it's the current year, else previous
     return today.year if today.month >= 10 else today.year - 1
 
-
 def parse_minutes(min_str):
-    """Convert min field ('38' or '38:21') to float minutes."""
-    if not min_str:
-        return 0.0
+    if not min_str: return 0.0
     s = str(min_str)
-    if s in ("0", "00:00", ""):
-        return 0.0
-    if ":" in s:
-        try:
+    if s in ("0", "00:00", ""): return 0.0
+    try:
+        if ":" in s:
             m, sec = s.split(":")
             return int(m) + int(sec) / 60.0
-        except Exception:
-            try:
-                return float(m)
-            except Exception:
-                return 0.0
-    try:
         return float(s)
-    except Exception:
-        return 0.0
-
+    except: return 0.0
 
 def normalize_team_name(name: str) -> str:
-    """Normalize team name for fuzzy matching (remove spaces/punct, lower)."""
-    if not name:
-        return ""
+    if not name: return ""
     return "".join(ch for ch in name.lower() if ch.isalnum())
 
-
 def get_team_logo_url(team_abbr: str):
-    """
-    Maps API abbreviations to ESPN Logo URLs.
-    Most are simple (BOS -> bos), but some need correction (UTA -> utah).
-    """
-    if not team_abbr:
-        return None
-
+    if not team_abbr: return None
     abbr = team_abbr.upper()
-
-    # ESPN uses slightly different codes for a few teams
-    corrections = {
-        "UTA": "utah",  # Jazz
-        "NOP": "no",    # Pelicans
-        "NYK": "ny",    # Knicks
-        "GSW": "gs",    # Warriors
-        "SAS": "sa",    # Spurs
-        "PHX": "phx",   # Suns
-        "WAS": "wsh",   # Wizards
-    }
-
+    corrections = {"UTA": "utah", "NOP": "no", "NYK": "ny", "GSW": "gs", "SAS": "sa", "PHX": "phx", "WAS": "wsh"}
     espn_code = corrections.get(abbr, abbr.lower())
     return f"https://a.espncdn.com/i/teamlogos/nba/500/scoreboard/{espn_code}.png"
 
+# --- CORE API FUNCTIONS ---
 
-# --- BALLDONTLIE TOOLS ---
-
+@st.cache_data(ttl=3600)
 def get_player_info_smart(user_input):
-    """
-    Smart player search:
-    1. Tries exact phrase search first.
-    2. If that fails, splits words to find partial matches.
-    3. Scores candidates by name and team matches.
-    """
     try:
         candidates = {}
+        clean_input = user_input.lower().replace(" suns", "").replace(" phx", "").strip()
         
-        # Strip common team identifiers
-        clean_input = user_input.lower()
-        for ignore in [" hornets", " cha", " charlotte", " suns", " phx", " lakers", " lal"]:
-            clean_input = clean_input.replace(ignore, "")
-        clean_input = clean_input.strip()
-
+        # Search exact and parts
         queries = [clean_input]
-        
-        # Flip "Last First" -> "First Last"
-        if " " in clean_input:
-            queries.append(" ".join(clean_input.split()[::-1]))
-
-        # Also search individual words
-        if len(clean_input.split()) > 1:
-            queries.extend(clean_input.split())
-
-        found_any = False
+        if " " in clean_input: queries.append(" ".join(clean_input.split()[::-1]))
         
         for q in queries:
-            if len(q) < 3:
-                continue
-                
-            try:
-                r = requests.get(
-                    url=f"{BDL_URL}/players",
-                    headers=get_bdl_headers(),
-                    params={"search": q, "per_page": 100},
-                    timeout=REQUEST_TIMEOUT,
-                )
-                if r.status_code == 200:
-                    data = r.json().get("data", [])
-                    for p in data:
-                        candidates[p["id"]] = p
-                        found_any = True
-            except Exception:
-                pass
-            
-            if found_any and q == clean_input:
-                break
-
-        if not candidates:
-            return None, f"Player '{user_input}' not found."
-
-        candidate_list = list(candidates.values())
-        scored_results = []
+            if len(q) < 3: continue
+            r = requests.get(f"{BDL_URL}/players", headers=get_bdl_headers(), params={"search": q, "per_page": 100}, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 200:
+                for p in r.json().get("data", []):
+                    candidates[p["id"]] = p
         
-        user_words = user_input.lower().split()
-
-        for p in candidate_list:
-            score = 0
-            fname = p['first_name'].lower()
-            lname = p['last_name'].lower()
-            full_name = f"{fname} {lname}"
-            
-            team_name = p['team']['full_name'].lower()
-            team_abbr = p['team']['abbreviation'].lower()
-
-            # 1. Name similarity (0-100)
-            sim = difflib.SequenceMatcher(None, clean_input, full_name).ratio()
-            score += sim * 100
-
-            # 2. Exact name bonus
-            if clean_input == full_name:
-                score += 50
-            
-            # 3. Team match bonus
-            if any(t in user_input.lower() for t in [team_name, team_abbr]):
-                score += 30
-
-            scored_results.append((score, p))
-
-        scored_results.sort(key=lambda x: x[0], reverse=True)
+        if not candidates: return None, "Player not found."
         
-        best_match = scored_results[0][1]
-        best_p_name = f"{best_match['first_name']} {best_match['last_name']}"
-        best_p_team = best_match['team']['full_name']
-
-        return best_match, f"Found: **{best_p_name}** ({best_p_team})"
-
-    except Exception as e:
-        return None, f"Search Error: {e}"
-
+        # Scoring
+        scored = []
+        for p in candidates.values():
+            score = difflib.SequenceMatcher(None, clean_input, f"{p['first_name']} {p['last_name']}".lower()).ratio()
+            scored.append((score, p))
+        
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best = scored[0][1]
+        return best, f"Found: {best['first_name']} {best['last_name']}"
+    except Exception as e: return None, f"Error: {e}"
 
 def get_team_injuries(team_id):
-    """Fetches official injury report with error handling."""
     try:
-        url = f"{BDL_URL}/player_injuries"
-        resp = requests.get(
-            url,
-            headers=get_bdl_headers(),
-            params={"team_ids[]": str(team_id)},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            return f"Error fetching injuries (status {resp.status_code})."
+        resp = requests.get(f"{BDL_URL}/player_injuries", headers=get_bdl_headers(), params={"team_ids[]": str(team_id)}, timeout=REQUEST_TIMEOUT)
         data = resp.json().get("data", [])
-        if not data:
-            return "No active injuries."
+        if not data: return "No active injuries."
+        return "\n".join([f"- {i['player']['first_name']} {i['player']['last_name']}: {i['status']}" for i in data])
+    except: return "Error fetching injuries."
 
-        reports = []
-        for i in data:
-            p_obj = i.get("player") or {}
-            name = f"{p_obj.get('first_name', '')} {p_obj.get('last_name', '')}"
-            status = i.get("status", "Unknown")
-            note = i.get("note") or i.get("comment") or i.get("description") or "No details"
-            reports.append(f"- **{name}**: {status} ({note})")
-        return "\n".join(reports)
-    except Exception as e:
-        return f"Error fetching injuries: {e}"
-
-
-def get_team_schedule_before_today(team_id, n_games: int = 7):
-    """
-    Fetch the team's last n finished games.
-    """
+def get_team_schedule_before_today(team_id, n_games=7):
     try:
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        current_season = get_current_season()
-        # Pull from both current and previous season to handle early season edge cases
-        seasons_to_check = [current_season, current_season - 1]
-
-        all_games = []
-
-        for season in seasons_to_check:
-            resp = requests.get(
-                f"{BDL_URL}/games",
-                headers=get_bdl_headers(),
-                params={
-                    "team_ids[]": str(team_id),
-                    "seasons[]": str(season),
-                    "end_date": today_str,
-                    "per_page": 100,
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code != 200:
-                continue
-
-            data = resp.json().get("data", [])
-            if isinstance(data, list):
-                all_games.extend(data)
-
-        if not all_games:
-            return []
-
-        finished = [g for g in all_games if g.get("status") == "Final"]
-        finished.sort(key=lambda x: x["date"], reverse=True)
-
-        return finished[:n_games]
-
-    except Exception:
-        return []
-
-def get_next_game_bdl(team_id, days_ahead: int = 14):
-    """
-    Find the next NON-FINAL game for a team using BallDontLie schedule.
-    """
-    try:
-        season = get_current_season()
         today = datetime.now().strftime("%Y-%m-%d")
-        future = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-
-        resp = requests.get(
-            f"{BDL_URL}/games",
-            headers=get_bdl_headers(),
-            params={
-                "team_ids[]": str(team_id),
-                "seasons[]": str(season),
-                "start_date": today,
-                "end_date": future,
-                "per_page": 50,
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            return None, None, None, None, None, None
-
-        data = resp.json().get("data", [])
-        if not data:
-            return None, None, None, None, None, None
-
-        # Sort upcoming games by date (soonest first)
-        data.sort(key=lambda x: x["date"])
-
-        for g in data:
-            status = g.get("status", "")
-            # Skip games that are already final; allow Scheduled / In Progress / etc.
-            if status == "Final":
-                continue
-
-            home = g.get("home_team", {})
-            visitor = g.get("visitor_team", {})
-
-            if home.get("id") == team_id:
-                loc = "vs"
-                opp = visitor
-            else:
-                loc = "@"
-                opp = home
-
-            matchup_str = f"{loc} {opp.get('full_name', 'Unknown')}"
-            date_str = g.get("date", "").split("T")[0]
-            return (
-                matchup_str,
-                date_str,
-                opp.get("id"),
-                opp.get("full_name"),
-                opp.get("abbreviation"),
-                g.get("id"),
-            )
-
-        return None, None, None, None, None, None
-
-    except Exception:
-        return None, None, None, None, None, None
+        # Check CURRENT and PREVIOUS season to ensure we find games early in the year
+        seasons = [get_current_season(), get_current_season()-1]
         
+        resp = requests.get(
+            f"{BDL_URL}/games", 
+            headers=get_bdl_headers(), 
+            params={
+                "team_ids[]": str(team_id), 
+                "seasons[]": seasons, 
+                "end_date": today, 
+                "per_page": 100, 
+                "status": "Final"
+            }, 
+            timeout=REQUEST_TIMEOUT
+        )
+        data = resp.json().get("data", [])
+        finished = [g for g in data if g["status"] == "Final"]
+        finished.sort(key=lambda x: x["date"], reverse=True)
+        return finished[:n_games]
+    except: return []
+
+def get_next_game_bdl(team_id):
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        future = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
+        resp = requests.get(f"{BDL_URL}/games", headers=get_bdl_headers(), params={"team_ids[]": str(team_id), "seasons[]": str(get_current_season()), "start_date": today, "end_date": future, "per_page": 50}, timeout=REQUEST_TIMEOUT)
+        data = resp.json().get("data", [])
+        data.sort(key=lambda x: x["date"])
+        
+        for g in data:
+            if g["status"] == "Final": continue
+            home = g["home_team"]
+            visitor = g["visitor_team"]
+            if home["id"] == team_id:
+                return (f"vs {visitor['full_name']}", g["date"].split("T")[0], visitor["id"], visitor["full_name"], visitor["abbreviation"], g["id"])
+            else:
+                return (f"@ {home['full_name']}", g["date"].split("T")[0], home["id"], home["full_name"], home["abbreviation"], g["id"])
+        return (None,)*6
+    except: return (None,)*6
+
 def get_player_stats_for_games(player_id, game_ids):
     """
-    Sniper approach:
-      - For each game_id, query the API *directly* for that player+game.
-      - Removes seasons parameter to avoid bugs.
+    BATCH FETCH: Fixes the Rate Limit / 'DNP' issue.
+    Fetches all stats in ONE call instead of looping.
     """
     stats_by_game = {}
-    if not game_ids:
-        return stats_by_game
+    if not game_ids: return stats_by_game
 
-    pid_str = str(player_id)
-
-    for gid in game_ids:
-        gid_str = str(gid)
-        try:
-            resp = requests.get(
-                f"{BDL_URL}/stats",
-                headers=get_bdl_headers(),
-                params={
-                    "player_ids[]": pid_str,     # filter by THIS player
-                    "game_ids[]": gid_str,       # and THIS game
-                    "per_page": 100,             
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code != 200:
-                continue
-
-            data = resp.json().get("data", [])
-            if not isinstance(data, list) or not data:
-                continue
-
-            # Find the stat row that actually matches our player ID (Double verification)
-            for s in data:
-                # BallDontLie returns player ID as integer, we compare as string to be safe
-                if str(s.get("player", {}).get("id")) == pid_str:
+    try:
+        # Send ALL game IDs and THIS player ID in one request
+        str_gids = [str(g) for g in game_ids]
+        resp = requests.get(
+            f"{BDL_URL}/stats",
+            headers=get_bdl_headers(),
+            params={
+                "game_ids[]": str_gids,
+                "player_ids[]": [str(player_id)], # Filter by player
+                "per_page": 100
+            },
+            timeout=REQUEST_TIMEOUT
+        )
+        
+        if resp.status_code == 200:
+            for s in resp.json().get("data", []):
+                gid = s["game"]["id"]
+                # Ensure strict string matching to avoid ID type bugs
+                if str(s["player"]["id"]) == str(player_id):
                     stats_by_game[gid] = s
-                    break
-
-        except Exception:
-            continue
-
+    except: pass
     return stats_by_game
-
-
-
-def compute_team_form(past_games, team_id):
-    """Compute simple PF/PA/net and record for last N games."""
-    if not past_games:
-        return {"pf": 0.0, "pa": 0.0, "net": 0.0, "wins": 0, "losses": 0, "games_used": 0}
-    pf_total = 0
-    pa_total = 0
-    wins = 0
-    losses = 0
-    games_counted = 0
-
-    for g in past_games:
-        home = g.get("home_team", {})
-        visitor = g.get("visitor_team", {})
-        hs = g.get("home_team_score", 0)
-        vs = g.get("visitor_team_score", 0)
-
-        if home.get("id") == team_id:
-            team_score = hs
-            opp_score = vs
-        elif visitor.get("id") == team_id:
-            team_score = vs
-            opp_score = hs
-        else:
-            continue  # should not happen
-
-        pf_total += team_score
-        pa_total += opp_score
-        games_counted += 1
-        if team_score > opp_score:
-            wins += 1
-        elif team_score < opp_score:
-            losses += 1
-
-    if games_counted == 0:
-        return {"pf": 0.0, "pa": 0.0, "net": 0.0, "wins": 0, "losses": 0, "games_used": 0}
-
-    pf = pf_total / games_counted
-    pa = pa_total / games_counted
-    net = pf - pa
-    return {"pf": pf, "pa": pa, "net": net, "wins": wins, "losses": losses, "games_used": games_counted}
-
 
 def compute_team_advanced_stats(team_id, games):
     """
-    Compute advanced team metrics over a window of games.
+    SAFE MATH FIX: Handles None values (nulls) from the API.
     """
-    empty = {
-        "games_used": 0, "off_rtg": 0.0, "def_rtg": 0.0, "net_rtg": 0.0, "pace": 0.0,
-        "fg_pct": 0.0, "two_pct": 0.0, "three_pct": 0.0, "three_pa_rate": 0.0,
-        "ft_pct": 0.0, "ftr": 0.0, "orb_pct": 0.0, "drb_pct": 0.0, "reb_pg": 0.0,
-        "tov_pg": 0.0, "tov_pct": 0.0,
-    }
-
-    if not games:
-        return empty
-
-    game_ids = [g.get("id") for g in games if g.get("id") is not None]
-    if not game_ids:
-        return empty
-
-    # --- fetch ALL stats rows for these games (paginate) ---
+    if not games: return {}
+    
+    # Fetch all stats for these games
+    gids = [g["id"] for g in games]
     all_stats = []
     try:
-        page = 1
-        while True:
-            params = {
-                "game_ids[]": [str(gid) for gid in game_ids],
-                "per_page": 100,
-                "page": page,
-            }
-            resp = requests.get(
-                f"{BDL_URL}/stats",
-                headers=get_bdl_headers(),
-                params=params,
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code != 200:
-                break
-            batch = resp.json().get("data", [])
-            if not batch:
-                break
-            all_stats.extend(batch)
-            if len(batch) < 100:
-                break
-            page += 1
-    except Exception:
-        all_stats = []
+        resp = requests.get(f"{BDL_URL}/stats", headers=get_bdl_headers(), params={"game_ids[]": gids, "per_page": 100}, timeout=REQUEST_TIMEOUT)
+        all_stats = resp.json().get("data", [])
+    except: pass
 
-    if not all_stats:
-        return empty
+    if not all_stats: return {}
 
-    # --- aggregate per game: team vs opponent ---
-    per_game = {}
+    # Aggregators
+    totals = {"team_pts": 0, "team_poss": 0, "opp_pts": 0}
+    
+    # Process per game to calculate possessions
+    game_map = {}
     for s in all_stats:
-        game = s.get("game") or {}
-        gid = game.get("id")
-        if gid not in game_ids:
-            continue
-
-        t = s.get("team") or {}
-        side = "team" if t.get("id") == team_id else "opp"
-
-        if gid not in per_game:
-            per_game[gid] = {
-                "team": {
-                    "pts": 0, "fgm": 0, "fga": 0, "fg3m": 0, "fg3a": 0,
-                    "ftm": 0, "fta": 0, "oreb": 0, "dreb": 0, "reb": 0, "tov": 0,
-                },
-                "opp": {
-                    "pts": 0, "fgm": 0, "fga": 0, "fg3m": 0, "fg3a": 0,
-                    "ftm": 0, "fta": 0, "oreb": 0, "dreb": 0, "reb": 0, "tov": 0,
-                },
-            }
-
-        # FIX: Use (value or 0) to handle NoneTypes safely
-        bucket = per_game[gid][side]
-        bucket["pts"] += (s.get("pts") or 0)
-        bucket["fgm"] += (s.get("fgm") or 0)
+        gid = s["game"]["id"]
+        tid = s["team"]["id"]
+        if gid not in game_map: game_map[gid] = {team_id: {"fga":0, "oreb":0, "tov":0, "fta":0, "pts":0}, "opp": {"fga":0, "oreb":0, "tov":0, "fta":0, "pts":0}}
+        
+        # Target bucket (Team or Opponent)
+        bucket = game_map[gid][team_id] if tid == team_id else game_map[gid]["opp"]
+        
+        # SAFE ADDITION: (val or 0) handles None
         bucket["fga"] += (s.get("fga") or 0)
-        bucket["fg3m"] += (s.get("fg3m") or 0)
-        bucket["fg3a"] += (s.get("fg3a") or 0)
-        bucket["ftm"] += (s.get("ftm") or 0)
-        bucket["fta"] += (s.get("fta") or 0)
         bucket["oreb"] += (s.get("oreb") or 0)
-        bucket["dreb"] += (s.get("dreb") or 0)
-        bucket["reb"] += (s.get("reb") or 0)
         bucket["tov"] += (s.get("turnover") or 0)
+        bucket["fta"] += (s.get("fta") or 0)
+        bucket["pts"] += (s.get("pts") or 0)
 
-    # --- accumulate over games ---
-    games_used = 0
-    tot_team_pts = tot_opp_pts = 0.0
-    tot_team_poss = tot_opp_poss = 0.0
+    for gid, data in game_map.items():
+        t = data[team_id]
+        o = data["opp"]
+        # Possessions formula: 0.96 * (FGA + TOV + 0.44*FTA - OREB)
+        t_poss = 0.96 * (t["fga"] + t["tov"] + 0.44*t["fta"] - t["oreb"])
+        totals["team_pts"] += t["pts"]
+        totals["opp_pts"] += o["pts"]
+        totals["team_poss"] += t_poss
 
-    tot_fgm = tot_fga = 0.0
-    tot_fg3m = tot_fg3a = 0.0
-    tot_ftm = tot_fta = 0.0
-    tot_oreb = tot_dreb = tot_reb = 0.0
-    tot_opp_oreb = tot_opp_dreb = 0.0
-    tot_tov = 0.0
-
-    for gid in game_ids:
-        rec = per_game.get(gid)
-        if not rec:
-            continue
-        team = rec["team"]
-        opp = rec["opp"]
-
-        team_poss = (
-            team["fga"]
-            - team["oreb"]
-            + team["tov"]
-            + 0.44 * team["fta"]
-        )
-        opp_poss = (
-            opp["fga"]
-            - opp["oreb"]
-            + opp["tov"]
-            + 0.44 * opp["fta"]
-        )
-
-        tot_team_pts += team["pts"]
-        tot_opp_pts += opp["pts"]
-        tot_team_poss += team_poss
-        tot_opp_poss += opp_poss
-
-        tot_fgm += team["fgm"]
-        tot_fga += team["fga"]
-        tot_fg3m += team["fg3m"]
-        tot_fg3a += team["fg3a"]
-        tot_ftm += team["ftm"]
-        tot_fta += team["fta"]
-        tot_oreb += team["oreb"]
-        tot_dreb += team["dreb"]
-        tot_reb += team["reb"]
-        tot_opp_oreb += opp["oreb"]
-        tot_opp_dreb += opp["dreb"]
-        tot_tov += team["tov"]
-
-        games_used += 1
-
-    if games_used == 0 or tot_team_poss <= 0:
-        return empty
-
-    off_rtg = 100.0 * tot_team_pts / tot_team_poss
-    def_rtg = 100.0 * tot_opp_pts / tot_team_poss
-    net_rtg = off_rtg - def_rtg
-
-    pace = (tot_team_poss + tot_opp_poss) / (2.0 * games_used)
-
-    fg_pct = tot_fgm / tot_fga if tot_fga > 0 else 0.0
-    two_fgm = tot_fgm - tot_fg3m
-    two_fga = tot_fga - tot_fg3a
-    two_pct = two_fgm / two_fga if two_fga > 0 else 0.0
-    three_pct = tot_fg3m / tot_fg3a if tot_fg3a > 0 else 0.0
-    three_pa_rate = tot_fg3a / tot_fga if tot_fga > 0 else 0.0
-
-    ft_pct = tot_ftm / tot_fta if tot_fta > 0 else 0.0
-    ftr = tot_fta / tot_fga if tot_fga > 0 else 0.0
-
-    orb_den = tot_oreb + tot_opp_dreb
-    drb_den = tot_dreb + tot_opp_oreb
-    orb_pct = tot_oreb / orb_den if orb_den > 0 else 0.0
-    drb_pct = tot_dreb / drb_den if drb_den > 0 else 0.0
-    reb_pg = tot_reb / games_used
-
-    tov_pg = tot_tov / games_used
-    tov_pct = tot_tov / tot_team_poss if tot_team_poss > 0 else 0.0
-
+    if totals["team_poss"] == 0: return {}
+    
     return {
-        "games_used": games_used,
-        "off_rtg": off_rtg,
-        "def_rtg": def_rtg,
-        "net_rtg": net_rtg,
-        "pace": pace,
-        "fg_pct": fg_pct,
-        "two_pct": two_pct,
-        "three_pct": three_pct,
-        "three_pa_rate": three_pa_rate,
-        "ft_pct": ft_pct,
-        "ftr": ftr,
-        "orb_pct": orb_pct,
-        "drb_pct": drb_pct,
-        "reb_pg": reb_pg,
-        "tov_pg": tov_pg,
-        "tov_pct": tov_pct,
+        "off_rtg": 100 * totals["team_pts"] / totals["team_poss"],
+        "def_rtg": 100 * totals["opp_pts"] / totals["team_poss"],
+        "net_rtg": 100 * (totals["team_pts"] - totals["opp_pts"]) / totals["team_poss"],
+        "games_used": len(games)
     }
 
-
-def get_team_players(team_id):
-    """Fetch current roster (players + positions) for a team."""
+def get_team_rotation(team_id, n_games=7):
+    """Calculates rotation using safe math."""
+    past_games = get_team_schedule_before_today(team_id, n_games)
+    if not past_games: return [], 0
+    
+    gids = [g["id"] for g in past_games]
     try:
-        resp = requests.get(
-            f"{BDL_URL}/players",
-            headers=get_bdl_headers(),
-            params={"team_ids[]": str(team_id), "per_page": 100},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            return {}
-        data = resp.json().get("data", [])
-        players = {}
-        for p in data:
-            pid = p.get("id")
-            players[pid] = {
-                "name": f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
-                "position": p.get("position", ""),
-            }
-        return players
-    except Exception:
-        return {}
-
-
-def get_bdl_team_by_name(name: str):
-    """Given a plain team name (from Odds API), find the best-matching BallDontLie team."""
-    try:
-        resp = requests.get(
-            f"{BDL_URL}/teams",
-            headers=get_bdl_headers(),
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            return {}
-        data = resp.json().get("data", [])
-        if not isinstance(data, list):
-            data = []
-
-        target = normalize_team_name(name)
-        best = None
-        best_score = 0.0
-        for t in data:
-            full_name = t.get("full_name", "")
-            n = normalize_team_name(full_name)
-            score = difflib.SequenceMatcher(a=target, b=n).ratio()
-            if score > best_score:
-                best_score = score
-                best = t
-        return best or {}
-    except Exception:
-        return {}
-
-
-def get_team_rotation(team_id, n_games: int = 7):
-    """
-    Approximate rotation for a team:
-    - Uses last n games' stats.
-    - Aggregates minutes + basic box for each player.
-    - Labels top 5 by avg minutes as 'Starter', rest as 'Bench/Rotation'.
-    - Uses both roster and stats to resolve actual player names/positions.
-    - Returns (rows, total_team_games_used)
-    """
-    past_games = get_team_schedule_before_today(team_id, n_games=n_games)
-    if not past_games:
-        return [], 0
-
-    total_games_used = len(past_games)
-    game_ids = [g["id"] for g in past_games]
-    try:
-        url = f"{BDL_URL}/stats"
-        params = {
-            "game_ids[]": [str(g) for g in game_ids],
-            "per_page": 100,
-        }
-        resp = requests.get(
-            url,
-            headers=get_bdl_headers(),
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            return [], total_games_used
+        resp = requests.get(f"{BDL_URL}/stats", headers=get_bdl_headers(), params={"game_ids[]": gids, "per_page": 100}, timeout=REQUEST_TIMEOUT)
         stats = resp.json().get("data", [])
-    except Exception:
-        return [], total_games_used
+    except: return [], 0
 
-    # Aggregate minutes & stats for this team only
-    per_player = {}
-    stats_players = {}
-
+    agg = {}
     for s in stats:
-        team = s.get("team") or {}
-        if team.get("id") != team_id:
-            continue
-
-        player = s.get("player") or {}
-        pid = player.get("id")
-        if not pid:
-            continue
-
-        if pid not in stats_players:
-            stats_players[pid] = {
-                "name": f"{player.get('first_name', '')} {player.get('last_name', '')}".strip(),
-                "position": player.get("position", ""),
-            }
-
-        min_val = parse_minutes(s.get("min"))
+        if s["team"]["id"] != team_id: continue
+        pid = s["player"]["id"]
+        if pid not in agg: agg[pid] = {"name": f"{s['player']['first_name']} {s['player']['last_name']}", "min": 0, "pts": 0, "gp": 0}
         
-        # FIX: Use (val or 0) for stats to avoid += NoneType errors
-        pts = (s.get("pts") or 0)
-        reb = (s.get("reb") or 0)
-        ast = (s.get("ast") or 0)
-        fg3m = (s.get("fg3m") or 0)
-
-        if pid not in per_player:
-            per_player[pid] = {
-                "total_min": 0.0,
-                "gp_non_dnp": 0,
-                "total_pts": 0,
-                "total_reb": 0,
-                "total_ast": 0,
-                "total_3pm": 0,
-            }
-
-        per_player[pid]["total_min"] += min_val
-        per_player[pid]["total_pts"] += pts
-        per_player[pid]["total_reb"] += reb
-        per_player[pid]["total_ast"] += ast
-        per_player[pid]["total_3pm"] += fg3m
-
-        if min_val > 0:
-            per_player[pid]["gp_non_dnp"] += 1
-
-    if not per_player:
-        return [], total_games_used
-
-    roster = get_team_players(team_id)
+        m = parse_minutes(s.get("min"))
+        if m > 0:
+            agg[pid]["min"] += m
+            agg[pid]["pts"] += (s.get("pts") or 0) # Safe math
+            agg[pid]["gp"] += 1
+            
     rows = []
-    for pid, agg in per_player.items():
-        gp = agg["gp_non_dnp"] or 1
-        avg_min = agg["total_min"] / gp
-        avg_pts = agg["total_pts"] / gp
-        avg_reb = agg["total_reb"] / gp
-        avg_ast = agg["total_ast"] / gp
-        avg_3pm = agg["total_3pm"] / gp
+    for p in agg.values():
+        if p["gp"] > 0:
+            rows.append({"Name": p["name"], "GP": p["gp"], "MIN": round(p["min"]/p["gp"],1), "PTS": round(p["pts"]/p["gp"],1)})
+    
+    rows.sort(key=lambda x: x["MIN"], reverse=True)
+    return rows, len(past_games)
 
-        info_roster = roster.get(pid, {})
-        info_stats = stats_players.get(pid, {})
-
-        name = (
-            info_roster.get("name")
-            or info_stats.get("name")
-            or f"Player {pid}"
-        )
-        position = (
-            info_roster.get("position")
-            or info_stats.get("position")
-            or ""
-        )
-
-        rows.append(
-            {
-                "Player ID": pid,
-                "Name": name,
-                "Pos": position,
-                "GP (non-DNP)": agg["gp_non_dnp"],
-                "Avg MIN": round(avg_min, 1),
-                "Avg PTS": round(avg_pts, 1),
-                "Avg REB": round(avg_reb, 1),
-                "Avg AST": round(avg_ast, 1),
-                "Avg 3PM": round(avg_3pm, 1),
-            }
-        )
-
-    rows.sort(key=lambda r: r["Avg MIN"], reverse=True)
-    for idx, r in enumerate(rows):
-        r["Role"] = "Starter" if idx < 5 else "Bench/Rotation"
-    return rows, total_games_used
-
-
-# --- BETTING API TOOLS (NOW CANONICAL FOR NEXT GAME) ---
-
-def get_betting_game_and_odds(player_name, team_name, bookmakers=None, debug: bool = False):
-    """
-    Canonical source of the upcoming game for this player/team.
-    """
+def get_betting_game_and_odds(player_name, team_name):
     api_key = os.environ.get("ODDS_API_KEY")
-    if not api_key:
-        return {
-            "odds_text": "Betting API key missing.",
-            "tipoff_iso": None,
-            "home_team": None,
-            "away_team": None,
-        }
-
+    if not api_key: return {"odds_text": "Missing Key", "tipoff_iso": None}
+    
     try:
-        # --- 1) GET GAME LINES (FEATURED MARKETS ONLY) ---
-        odds_resp = requests.get(
-            f"{ODDS_URL}/odds",
-            params={
-                "apiKey": api_key,
-                "regions": "us",
-                "markets": "h2h",
-                "dateFormat": "iso",
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-
-        if odds_resp.status_code != 200:
-            try:
-                msg = odds_resp.json().get("message", odds_resp.text)
-            except Exception:
-                msg = odds_resp.text
-            return {
-                "odds_text": f"Error fetching games from Betting API (status {odds_resp.status_code}): {msg}",
-                "tipoff_iso": None,
-                "home_team": None,
-                "away_team": None,
-            }
-
-        games = odds_resp.json()
-        if not isinstance(games, list) or not games:
-            return {
-                "odds_text": "No betting lines available.",
-                "tipoff_iso": None,
-                "home_team": None,
-                "away_team": None,
-            }
-
-        team_norm = normalize_team_name(team_name)
-        best_future_game = None
-        best_future_time = None
-        closest_any_game = None
-        closest_any_time = None
-
-        now_utc = datetime.now(timezone.utc)
-
-        # --- pick the nearest future event (or closest overall as fallback) ---
-        for g in games:
-            ht = g.get("home_team") or ""
-            at = g.get("away_team") or ""
-
-            if team_norm not in normalize_team_name(ht) and team_norm not in normalize_team_name(at):
-                continue
-
-            ct = g.get("commence_time")
-            if not ct:
-                continue
-
-            try:
-                dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
-            except Exception:
-                continue
-
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-
-            # Future game for that team
-            if dt >= now_utc:
-                if best_future_time is None or dt < best_future_time:
-                    best_future_time = dt
-                    best_future_game = g
-
-            # Closest event regardless of past/future
-            if closest_any_time is None or abs((dt - now_utc).total_seconds()) < abs((closest_any_time - now_utc).total_seconds()):
-                closest_any_time = dt
-                closest_any_game = g
-
-        selected_game = best_future_game or closest_any_game
-        tipoff_dt = best_future_time or closest_any_time
-
-        if not selected_game:
-            return {
-                "odds_text": f"No active betting lines found for {team_name}.",
-                "tipoff_iso": None,
-                "home_team": None,
-                "away_team": None,
-            }
-
-        game_id = selected_game.get("id")
-        tipoff_iso = tipoff_dt.isoformat() if tipoff_dt else selected_game.get("commence_time")
-        home_team = selected_game.get("home_team")
-        away_team = selected_game.get("away_team")
-
-        # --- game moneyline from ALL bookmakers (already in /odds response) ---
-        bookmakers_list = selected_game.get("bookmakers", [])
-        moneyline_lines = []
-
-        for b in bookmakers_list:
-            b_title = b.get("title") or b.get("key", "Book")
-            h2h_market = next(
-                (m for m in b.get("markets", []) if m.get("key") == "h2h"),
-                None,
-            )
-            if not h2h_market:
-                continue
-            outcomes = h2h_market.get("outcomes", [])
-            if len(outcomes) < 2:
-                continue
-
-            parts = [
-                f"{o.get('name', 'Team')} ({o.get('price', 'N/A')})"
-                for o in outcomes
-            ]
-            ml_str = " vs ".join(parts)
-            moneyline_lines.append(f"- **{b_title}**: {ml_str}")
-
-        # --- 2) PLAYER PROPS VIA /events/{id}/odds (non-featured markets allowed here) ---
-        props_lines = []
-        props_bookmaker_title = None
-
-        try:
-            props_params = {
-                "apiKey": api_key,
-                "regions": "us",
-                "markets": "player_points,player_rebounds,player_assists",
-                "dateFormat": "iso",
-            }
-            if bookmakers:
-                props_params["bookmakers"] = bookmakers
-
-            props_resp = requests.get(
-                f"{ODDS_URL}/events/{game_id}/odds",
-                params=props_params,
-                timeout=REQUEST_TIMEOUT,
-            )
-
-            if props_resp.status_code == 200:
-                props_data = props_resp.json()
-                props_books = props_data.get("bookmakers", [])
-
-                # Prefer FanDuel if available
-                preferred_key = "fanduel"
-                props_bookmaker = next(
-                    (b for b in props_books if b.get("key") == preferred_key),
-                    props_books[0] if props_books else None,
-                )
-
-                if props_bookmaker:
-                    props_bookmaker_title = props_bookmaker.get("title") or props_bookmaker.get("key", "Book")
-                    p_last = player_name.split()[-1].lower()
-
-                    for market in props_bookmaker.get("markets", []):
-                        mkey = market.get("key", "")
-                        if not mkey.startswith("player_"):
-                            continue
-                        market_name = mkey.replace("player_", "").title()
-                        for outcome in market.get("outcomes", []):
-                            desc = outcome.get("description", "")
-                            if p_last in desc.lower():
-                                line = outcome.get("point", "N/A")
-                                price = outcome.get("price", "N/A")
-                                props_lines.append(f"**{market_name}**: {line} ({price})")
-
-        except Exception:
-            pass
-
-        # --- build final text ---
-        sections = []
-
-        if props_lines:
-            label = f"**Player Props ({props_bookmaker_title})**" if props_bookmaker_title else "**Player Props**"
-            sections.append(label + ":\n" + " | ".join(props_lines))
-
-        if moneyline_lines:
-            sections.append("**Game Moneyline (All Books):**\n" + "\n".join(moneyline_lines))
-
-        odds_text = "No odds available."
-        if sections:
-            odds_text = "\n\n".join(sections)
-
-        return {
-            "odds_text": odds_text,
-            "tipoff_iso": tipoff_iso,
-            "home_team": home_team,
-            "away_team": away_team,
-        }
-
-    except Exception as e:
-        return {
-            "odds_text": f"Error fetching odds: {e}",
-            "tipoff_iso": None,
-            "home_team": None,
-            "away_team": None,
-        }
-
-
-
-# --- CORE ANALYSIS PIPELINE ---
-def run_analysis(player_input: str, llm: ChatOpenAI):
-    """Execute the full pipeline once user hits the Run button."""
-    status_box = st.status("🔍 Scouting in progress...", expanded=True)
-
-    try:
-        # 1. Player Info
-        status_box.write("Finding player...")
-        player_obj, msg = get_player_info_smart(player_input)
-        if not player_obj:
-            status_box.update(label="Player Not Found", state="error")
-            st.error(msg)
-            st.stop()
-
-        pid = player_obj["id"]
-        fname = player_obj["first_name"]
-        lname = player_obj["last_name"]
-        tid = player_obj["team"]["id"]
-        tname = player_obj["team"]["full_name"]
-        tabbr = player_obj["team"]["abbreviation"]
-        st.success(msg)
-
-        # 2. Next game from BallDontLie (primary schedule source)
-        status_box.write("Finding next scheduled game...")
-        matchup = "Unknown matchup"
-        game_date_display = "Unknown date"
-        opp_id = None
-        opp_name_bdl = "Unknown opponent"
-        opp_abbr = ""
-
-        (
-            bdl_matchup,
-            bdl_date,
-            bdl_opp_id,
-            bdl_opp_name,
-            bdl_opp_abbr,
-            _,
-        ) = get_next_game_bdl(tid, days_ahead=14)
-
-        if bdl_matchup and bdl_date and bdl_opp_id:
-            matchup = bdl_matchup
-            game_date_display = bdl_date
-            opp_id = bdl_opp_id
-            if bdl_opp_name:
-                opp_name_bdl = bdl_opp_name
-            if bdl_opp_abbr:
-                opp_abbr = bdl_opp_abbr
-
-        # 3. Betting Game + Odds (may or may not align perfectly with BDL)
-        status_box.write("Finding betting event & lines...")
-        betting = get_betting_game_and_odds(f"{fname} {lname}", tname)
-        betting_lines = betting["odds_text"]
-        tipoff_iso = betting["tipoff_iso"]
-        odds_home = betting["home_team"]
-        odds_away = betting["away_team"]
-
-        # If BDL couldn't find next game, try to infer matchup from Betting API
-        if matchup == "Unknown matchup" and odds_home and odds_away:
-            norm_team = normalize_team_name(tname)
-            home_norm = normalize_team_name(odds_home)
-            away_norm = normalize_team_name(odds_away)
-
-            if norm_team in home_norm:
-                opp_guess = odds_away
-                loc = "vs"
-            elif norm_team in away_norm:
-                opp_guess = odds_home
-                loc = "@"
-            else:
-                opp_guess = odds_away
-                loc = "vs"
-
-            matchup = f"{loc} {opp_guess}"
-
-            # Map guessed opponent into BDL if we still don't have opp_id
-            if not opp_id:
-                opp_team_bdl = get_bdl_team_by_name(opp_guess)
-                opp_id = opp_team_bdl.get("id")
-                opp_abbr = opp_team_bdl.get("abbreviation", opp_abbr)
-                opp_name_bdl = opp_team_bdl.get("full_name", opp_guess)
-
-        # If Betting API has tipoff time and BDL didn't give a date, use betting date
-        if tipoff_iso and game_date_display == "Unknown date":
-            try:
-                tip_dt = datetime.fromisoformat(tipoff_iso.replace("Z", "+00:00"))
-                game_date_display = tip_dt.date().isoformat()
-            except Exception:
-                pass
-
-        # 4. Injuries
-        status_box.write("Fetching injuries...")
-        inj_home = get_team_injuries(tid) if tid else "N/A"
-        inj_opp = get_team_injuries(opp_id) if opp_id else "N/A"
-
-        # 5. Home Team Stats (Last 7 Games + Strict DNP)
-        status_box.write("Crunching stats...")
-        past_games = get_team_schedule_before_today(tid, n_games=7)
-        adv_home = compute_team_advanced_stats(tid, past_games)
-        gids = [g["id"] for g in past_games]
-        stats_by_game = get_player_stats_for_games(pid, gids)
+        # Fetch Games
+        resp = requests.get(f"{ODDS_URL}/odds", params={"apiKey": api_key, "regions": "us", "markets": "h2h", "dateFormat": "iso"}, timeout=REQUEST_TIMEOUT)
+        games = resp.json()
+        if not isinstance(games, list): return {"odds_text": "No odds.", "tipoff_iso": None}
         
-        log_lines = []
-        stats_rows = []
+        # Find Matching Game
+        target = normalize_team_name(team_name)
+        now = datetime.now(timezone.utc)
+        best_game = None
+        
+        for g in games:
+            if target in normalize_team_name(g["home_team"]) or target in normalize_team_name(g["away_team"]):
+                dt = datetime.fromisoformat(g["commence_time"].replace("Z", "+00:00"))
+                if dt > now - timedelta(hours=12): # Include active games
+                    if not best_game or dt < datetime.fromisoformat(best_game["commence_time"].replace("Z", "+00:00")):
+                        best_game = g
+        
+        if not best_game: return {"odds_text": "No upcoming odds.", "tipoff_iso": None}
+        
+        # Fetch Props for that game
+        gid = best_game["id"]
+        props_text = []
+        try:
+            p_resp = requests.get(f"{ODDS_URL}/events/{gid}/odds", params={"apiKey": api_key, "regions": "us", "markets": "player_points,player_rebounds"}, timeout=REQUEST_TIMEOUT)
+            if p_resp.status_code == 200:
+                book = p_resp.json()["bookmakers"][0]
+                p_last = player_name.split()[-1].lower()
+                for m in book["markets"]:
+                    for o in m["outcomes"]:
+                        if p_last in o["description"].lower():
+                            props_text.append(f"{m['key'].replace('player_','').title()}: {o['point']} ({o['price']})")
+        except: pass
+        
+        return {"odds_text": "\n".join(props_text) or "Moneyline only.", "tipoff_iso": best_game["commence_time"]}
+    except: return {"odds_text": "Error.", "tipoff_iso": None}
 
+# --- MAIN LOGIC ---
+
+def run_analysis(player_input, llm):
+    status = st.status("🚀 Running Analysis...", expanded=True)
+    
+    try:
+        # 1. Player
+        status.write("Searching player...")
+        p_obj, msg = get_player_info_smart(player_input)
+        if not p_obj:
+            status.update(label="Player Not Found", state="error"); st.stop()
+        
+        pid = p_obj["id"]
+        tid = p_obj["team"]["id"]
+        
+        # 2. Schedule
+        status.write("Checking schedule...")
+        matchup, date, opp_id, opp_name, opp_abbr, gid = get_next_game_bdl(tid)
+        
+        # 3. Odds
+        betting = get_betting_game_and_odds(p_obj["first_name"] + " " + p_obj["last_name"], p_obj["team"]["full_name"])
+        
+        # 4. Data
+        status.write("Fetching stats (Batched)...")
+        # Batch 1: Injuries
+        inj_home = get_team_injuries(tid)
+        
+        # Batch 2: Stats
+        past_games = get_team_schedule_before_today(tid, 7)
+        gids = [g["id"] for g in past_games]
+        
+        # THIS IS THE FIX: Single API call for all 7 games
+        stats_map = get_player_stats_for_games(pid, gids)
+        
+        # Advanced Stats (with Safe Math fix)
+        adv_stats = compute_team_advanced_stats(tid, past_games)
+        
+        # Build UI Table
+        rows = []
+        log_text = []
         for g in past_games:
-            gid = g["id"]
-            d = g["date"].split("T")[0]
-
-            home = g.get("home_team", {})
-            visitor = g.get("visitor_team", {})
-
-            if home.get("id") == tid:
-                opp_abbr_log = visitor.get("abbreviation", "UNK")
-                loc = "vs"
-            else:
-                opp_abbr_log = home.get("abbreviation", "UNK")
-                loc = "@"
-
-            stat = stats_by_game.get(gid)
-
-            # STRICT DNP CHECK
-            min_val_raw = stat.get("min") if stat else None
-            played = bool(
-                min_val_raw
-                and str(min_val_raw) not in ("0", "00:00", "")
-            )
-
+            s = stats_map.get(g["id"])
+            played = s and parse_minutes(s.get("min")) > 0
+            opp = g["visitor_team"]["abbreviation"] if g["home_team"]["id"] == tid else g["home_team"]["abbreviation"]
+            
             if played:
-                fg_pct = stat.get("fg_pct")
-                fg = f"{fg_pct * 100:.0f}%" if fg_pct else "0%"
-                fg3m = stat.get("fg3m", 0)
-                fg3a = stat.get("fg3a", 0)
-                fg3 = f"{fg3m}/{fg3a}"
-                line = (
-                    f"MIN:{min_val_raw} | PTS:{stat.get('pts', 0)} "
-                    f"REB:{stat.get('reb', 0)} AST:{stat.get('ast', 0)} | FG:{fg} 3PT:{fg3}"
-                )
+                # Safe access to stats
+                pts = s.get("pts") or 0
+                reb = s.get("reb") or 0
+                ast = s.get("ast") or 0
+                rows.append({"Date": g["date"][:10], "Opp": opp, "MIN": parse_minutes(s["min"]), "PTS": pts, "REB": reb, "AST": ast})
+                log_text.append(f"{g['date'][:10]} vs {opp}: {pts} pts")
             else:
-                line = "⛔ DNP (Did Not Play)"
+                rows.append({"Date": g["date"][:10], "Opp": opp, "MIN": 0, "PTS": 0, "REB": 0, "AST": 0})
 
-            log_lines.append(f"[{d}] {loc} {opp_abbr_log} | {line}")
-
-            mins_numeric = parse_minutes(min_val_raw) if played else 0
-            stats_rows.append(
-                {
-                    "Date": d,
-                    "Location": loc,
-                    "Opponent": opp_abbr_log,
-                    "MIN": mins_numeric,
-                    "PTS": stat.get("pts", 0) if stat else 0,
-                    "REB": stat.get("reb", 0) if stat else 0,
-                    "AST": stat.get("ast", 0) if stat else 0,
-                    "3PM": stat.get("fg3m", 0) if stat else 0,
-                    "3PA": stat.get("fg3a", 0) if stat else 0,
-                    "Is_DNP": not played,
-                }
-            )
-
-        final_log = "\n".join(log_lines)
-
-        # 6. Opponent team's last 7 results (from BDL) + advanced stats
-        opp_results_rows = []
-        opp_past_games = []
-        adv_opp = {}
-        if opp_id:
-            opp_past_games = get_team_schedule_before_today(opp_id, n_games=7)
-            adv_opp = compute_team_advanced_stats(opp_id, opp_past_games)
-            for g in opp_past_games:
-                d = g["date"].split("T")[0]
-                home = g.get("home_team", {})
-                visitor = g.get("visitor_team", {})
-                home_score = g.get("home_team_score", 0)
-                visitor_score = g.get("visitor_team_score", 0)
-
-                is_home = home.get("id") == opp_id
-                loc = "vs" if is_home else "@"
-                opp_team_obj = visitor if is_home else home
-                opp_abbr_team = opp_team_obj.get("abbreviation", "UNK")
-
-                if is_home:
-                    team_score = home_score
-                    opp_score = visitor_score
-                else:
-                    team_score = visitor_score
-                    opp_score = home_score
-
-                if team_score > opp_score:
-                    result = "W"
-                elif team_score < opp_score:
-                    result = "L"
-                else:
-                    result = "T"
-
-                opp_results_rows.append(
-                    {
-                        "Date": d,
-                        "Location": loc,
-                        "Opponent": opp_abbr_team,
-                        "Team Score": team_score,
-                        "Opponent Score": opp_score,
-                        "Result": result,
-                    }
-                )
-
-        # 7. Team form snapshot (strength/weakness proxy)
-        team_form = compute_team_form(past_games, tid)
-
-        # 8. Rotations
-        rotation_rows, rotation_games_used = get_team_rotation(tid, n_games=7)
-        opp_rotation_rows, opp_rotation_games_used = ([], 0)
-        if opp_id:
-            opp_rotation_rows, opp_rotation_games_used = get_team_rotation(opp_id, n_games=7)
-
-        # 9. GPT Analysis
-        status_box.write("Consulting AI coach...")
+        # 5. AI
+        status.write("Consulting GPT-4.1...")
         prompt = f"""
-Role: Expert Sports Bettor.
-Target: {fname} {lname} ({tname})
-Matchup: {matchup}
-Game Date: {game_date_display}
-
-ODDS:
-{betting_lines}
-
-INJURIES:
-{tname}: {inj_home}
-{opp_name_bdl}: {inj_opp}
-
-RECENT FORM (Last 7 Team Games):
-{final_log}
-
-TEAM FORM (Last {team_form.get('games_used', 0)} Games):
-- Avg Points For: {team_form.get('pf', 0):.1f}
-- Avg Points Against: {team_form.get('pa', 0):.1f}
-- Approx Net Rating: {team_form.get('net', 0):+.1f}
-- Record: {team_form.get('wins', 0)}–{team_form.get('losses', 0)}
-
-Tasks:
-1. Line Value: Compare stats to the odds (if player props are available).
-2. Prediction: Project points / rebounds / assists.
-3. Recommendation: Suggest a lean (prop or moneyline) with risk language (edge, high variance).
-4. Team View: Briefly describe this team's offensive and defensive strengths/weaknesses based on the form.
-
-Rules:
-- Do NOT guarantee outcomes.
-- Do NOT claim certainty.
-- Use terms like "lean", "slight edge", "volatile", "high variance".
-"""
+        Analyze {p_obj['first_name']} {p_obj['last_name']} ({p_obj['team']['abbreviation']}).
+        Matchup: {matchup}
+        Odds: {betting['odds_text']}
+        
+        Last 7 Games:
+        {log_text}
+        
+        Team Advanced Stats (Last 7):
+        Off Rtg: {adv_stats.get('off_rtg', 0):.1f}
+        Def Rtg: {adv_stats.get('def_rtg', 0):.1f}
+        
+        Injuries: {inj_home}
+        """
         analysis = llm.invoke(prompt).content
-
-        # Save in session state
+        
         st.session_state.analysis_data = {
-            "player": f"{fname} {lname}",
-            "team_name": tname,
-            "team_abbr": tabbr,
-            "matchup": matchup,
-            "date": game_date_display,
-            "odds": betting_lines,
-            "log": final_log,
-            "analysis": analysis,
-            "inj_home": inj_home,
-            "inj_opp": inj_opp,
-            "context": prompt + "\n\nAnalysis:\n" + analysis,
-            "stats_rows": stats_rows,
-            "opp_results_rows": opp_results_rows,
-            "opp_name": opp_name_bdl,
-            "opp_abbr": opp_abbr,
-            "team_form": team_form,
-            "rotation_rows": rotation_rows,
-            "rotation_games_used": rotation_games_used,
-            "opp_rotation_rows": opp_rotation_rows,
-            "opp_rotation_games_used": opp_rotation_games_used,
-            "tipoff_iso": tipoff_iso,
-            "adv_home": adv_home,
-            "adv_opp": adv_opp,
+            "player": p_obj, "rows": rows, "analysis": analysis, "odds": betting, "matchup": matchup
         }
-        st.session_state.messages = [{"role": "assistant", "content": analysis}]
-        status_box.update(label="Ready!", state="complete", expanded=False)
+        status.update(label="Done!", state="complete", expanded=False)
         st.rerun()
-
+        
     except Exception as e:
-        status_box.update(label="System Error", state="error")
-        st.error(f"Error: {e}")
+        status.update(label="Error", state="error")
+        st.error(f"Traceback: {e}")
 
-
-# --- MAIN APP ENTRY ---
-
-if api_keys.get("bdl") and api_keys.get("openai") and api_keys.get("odds"):
-
-    llm = ChatOpenAI(model="gpt-4.1-nano", temperature=0.5, api_key=api_keys["openai"])
-
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        p_name = st.text_input("Player Name", "Devin Booker")
-    with col2:
-        st.write("")
-        st.write("")
-        run_btn = st.button("🚀 Run Analysis", type="primary", width="stretch")
-
-    if run_btn:
-        run_analysis(p_name, llm)
-
+# --- UI ---
+if api_keys["bdl"] and api_keys["openai"]:
+    llm = ChatOpenAI(model="gpt-4o", api_key=api_keys["openai"])
+    
+    col1, col2 = st.columns([3,1])
+    p_input = col1.text_input("Player", "Devin Booker")
+    if col2.button("Run Analysis", type="primary"):
+        run_analysis(p_input, llm)
+        
     data = st.session_state.analysis_data
-
     if data:
-        st.divider()
-
-        p_label = data.get("player", "Unknown")
-        m_label = data.get("matchup", "Unknown")
-        d_label = data.get("date", "")
-
-        team_abbr = data.get("team_abbr")
-        opp_abbr = data.get("opp_abbr")
-
-        home_logo = get_team_logo_url(team_abbr)
-        away_logo = get_team_logo_url(opp_abbr)
-
-        # Header: logos + matchup + countdown
-        logo_col1, mid_col, logo_col2 = st.columns([1, 3, 1])
-        with logo_col1:
-            if home_logo:
-                st.image(home_logo, width=80)
-            if team_abbr:
-                st.caption(team_abbr)
-        with mid_col:
-            st.markdown(f"### 📊 Report: {p_label}  \n**Matchup:** {m_label}")
-            st.caption(f"Date: {d_label}")
-
-            tipoff_iso = data.get("tipoff_iso")
-            if tipoff_iso:
-                try:
-                    tip_dt = datetime.fromisoformat(tipoff_iso.replace("Z", "+00:00"))
-                    now = datetime.now(timezone.utc)
-                    delta = tip_dt - now
-                    secs = int(delta.total_seconds())
-                    if secs > 0:
-                        hours, rem = divmod(secs, 3600)
-                        minutes, _ = divmod(rem, 60)
-                        st.metric("Time to tipoff (approx)", f"{hours}h {minutes}m")
-                    else:
-                        st.metric("Time to tipoff (approx)", "Tipoff passed")
-                except Exception:
-                    pass
-        with logo_col2:
-            if away_logo:
-                st.image(away_logo, width=80)
-            if opp_abbr:
-                st.caption(opp_abbr)
-
-        st.info(f"🎰 **Market Odds:**\n\n{data.get('odds', 'No odds data')}")
-
-        # Team Form metrics
-        team_form = data.get("team_form") or {}
-        if team_form:
-            games_used = team_form.get("games_used", 0) or 0
-            label_games = games_used if games_used > 0 else 7
-            st.subheader(f"📈 Team Form (Last {label_games} Games)")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Offense (PF)", f"{team_form.get('pf', 0):.1f} PPG")
-            c2.metric("Defense (PA)", f"{team_form.get('pa', 0):.1f} PPG")
-            c3.metric("Net Rating (approx)", f"{team_form.get('net', 0):+.1f}")
-            c4.metric("Record", f"{team_form.get('wins', 0)}–{team_form.get('losses', 0)}")
-
-        # Advanced team metrics (home + opponent)
-        adv_home = data.get("adv_home") or {}
-        adv_opp = data.get("adv_opp") or {}
-
-        if (adv_home and adv_home.get("games_used", 0) > 0) or (adv_opp and adv_opp.get("games_used", 0) > 0):
-            st.subheader("📊 Advanced Team Metrics (Recent Games)")
-            col_home, col_opp = st.columns(2)
-
-            if adv_home and adv_home.get("games_used", 0) > 0:
-                with col_home:
-                    st.markdown(f"**{data.get('team_name', 'Home Team')}** \n_Games: {adv_home.get('games_used', 0)}_")
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Off Rtg", f"{adv_home.get('off_rtg', 0):.1f}")
-                    m2.metric("Def Rtg", f"{adv_home.get('def_rtg', 0):.1f}")
-                    m3.metric("Net Rtg", f"{adv_home.get('net_rtg', 0):+.1f}")
-
-                    m4, m5, m6 = st.columns(3)
-                    m4.metric("Pace", f"{adv_home.get('pace', 0):.1f}")
-                    m5.metric("FG%", f"{adv_home.get('fg_pct', 0)*100:.1f}%")
-                    m6.metric("3P%", f"{adv_home.get('three_pct', 0)*100:.1f}%")
-
-                    m7, m8, m9 = st.columns(3)
-                    m7.metric("FT%", f"{adv_home.get('ft_pct', 0)*100:.1f}%")
-                    m8.metric("3PA Rate", f"{adv_home.get('three_pa_rate', 0):.2f}")
-                    m9.metric("FTr", f"{adv_home.get('ftr', 0):.2f}")
-
-                    m10, m11, m12 = st.columns(3)
-                    m10.metric("ORB%", f"{adv_home.get('orb_pct', 0)*100:.1f}%")
-                    m11.metric("DRB%", f"{adv_home.get('drb_pct', 0)*100:.1f}%")
-                    m12.metric("REB/G", f"{adv_home.get('reb_pg', 0):.1f}")
-
-                    m13, m14 = st.columns(2)
-                    m13.metric("TOV/G", f"{adv_home.get('tov_pg', 0):.1f}")
-                    m14.metric("TOV%", f"{adv_home.get('tov_pct', 0)*100:.1f}%")
-
-            if adv_opp and adv_opp.get("games_used", 0) > 0:
-                with col_opp:
-                    st.markdown(f"**{data.get('opp_name', 'Opponent Team')}** \n_Games: {adv_opp.get('games_used', 0)}_")
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Off Rtg", f"{adv_opp.get('off_rtg', 0):.1f}")
-                    m2.metric("Def Rtg", f"{adv_opp.get('def_rtg', 0):.1f}")
-                    m3.metric("Net Rtg", f"{adv_opp.get('net_rtg', 0):+.1f}")
-
-                    m4, m5, m6 = st.columns(3)
-                    m4.metric("Pace", f"{adv_opp.get('pace', 0):.1f}")
-                    m5.metric("FG%", f"{adv_opp.get('fg_pct', 0)*100:.1f}%")
-                    m6.metric("3P%", f"{adv_opp.get('three_pct', 0)*100:.1f}%")
-
-                    m7, m8, m9 = st.columns(3)
-                    m7.metric("FT%", f"{adv_opp.get('ft_pct', 0)*100:.1f}%")
-                    m8.metric("3PA Rate", f"{adv_opp.get('three_pa_rate', 0):.2f}")
-                    m9.metric("FTr", f"{adv_opp.get('ftr', 0):.2f}")
-
-                    m10, m11, m12 = st.columns(3)
-                    m10.metric("ORB%", f"{adv_opp.get('orb_pct', 0)*100:.1f}%")
-                    m11.metric("DRB%", f"{adv_opp.get('drb_pct', 0)*100:.1f}%")
-                    m12.metric("REB/G", f"{adv_opp.get('reb_pg', 0):.1f}")
-
-                    m13, m14 = st.columns(2)
-                    m13.metric("TOV/G", f"{adv_opp.get('tov_pg', 0):.1f}")
-                    m14.metric("TOV%", f"{adv_opp.get('tov_pct', 0)*100:.1f}%")
-
-        # Rotations
-        rotation_rows = data.get("rotation_rows")
-        rotation_games_used = data.get("rotation_games_used", 0)
-        if rotation_rows:
-            games_label = rotation_games_used if rotation_games_used else 7
-            st.subheader(
-                f"🧩 {data.get('team_name', 'Team')} Rotation & Stats "
-                f"(Last {games_label} Team Games)"
-            )
-            df_rot = pd.DataFrame(rotation_rows)
-            if "Player ID" in df_rot.columns:
-                df_rot = df_rot.drop(columns=["Player ID"])
-            st.dataframe(df_rot, width="stretch")
-        opp_rotation_rows = data.get("opp_rotation_rows")
-        opp_rotation_games_used = data.get("opp_rotation_games_used", 0)
-        if opp_rotation_rows:
-            games_label_opp = opp_rotation_games_used if opp_rotation_games_used else 7
-            opp_name = data.get("opp_name", "Opponent Team")
-            st.subheader(
-                f"🧩 {opp_name} Rotation & Stats "
-                f"(Last {games_label_opp} Team Games)"
-            )
-            df_opp_rot = pd.DataFrame(opp_rotation_rows)
-            if "Player ID" in df_opp_rot.columns:
-                df_opp_rot = df_opp_rot.drop(columns=["Player ID"])
-            st.dataframe(df_opp_rot, width="stretch")
-
-        # Player stats + KPIs
-        stats_rows = data.get("stats_rows")
-        if stats_rows:
-            df_stats = pd.DataFrame(stats_rows)
-
-            try:
-                df_played = df_stats[~df_stats["Is_DNP"]].copy()
-                if not df_played.empty:
-                    avg_min = df_played["MIN"].mean()
-                    avg_pts = df_played["PTS"].mean()
-                    avg_reb = df_played["REB"].mean()
-                    avg_ast = df_played["AST"].mean()
-                    avg_3pm = df_played["3PM"].mean()
-
-                    st.subheader(f"🎯 {p_label} – Key Averages (Last Games Played)")
-                    kc1, kc2, kc3, kc4, kc5 = st.columns(5)
-                    kc1.metric("MIN", f"{avg_min:.1f}")
-                    kc2.metric("PTS", f"{avg_pts:.1f}")
-                    kc3.metric("REB", f"{avg_reb:.1f}")
-                    kc4.metric("AST", f"{avg_ast:.1f}")
-                    kc5.metric("3PM", f"{avg_3pm:.1f}")
-            except Exception:
-                pass
-
-            st.subheader(f"📜 {p_label} – Game Log (Last Team Games)")
-            st.dataframe(df_stats, width="stretch")
-
-            last_played = next((row for row in stats_rows if not row["Is_DNP"]), None)
-            if last_played:
-                st.subheader("🕒 Last Game Played (Most Recent Non-DNP)")
-                st.table(
-                    pd.DataFrame(
-                        [
-                            {
-                                "Date": last_played["Date"],
-                                "Location": last_played["Location"],
-                                "Opponent": last_played["Opponent"],
-                                "MIN": last_played["MIN"],
-                                "PTS": last_played["PTS"],
-                                "REB": last_played["REB"],
-                                "AST": last_played["AST"],
-                                "3PM": last_played["3PM"],
-                                "3PA": last_played["3PA"],
-                            }
-                        ]
-                    )
-                )
-
-            try:
-                df_played_chart = df_stats[~df_stats["Is_DNP"]].copy()
-                if not df_played_chart.empty:
-                    df_played_chart.set_index("Date", inplace=True)
-                    st.line_chart(df_played_chart[["PTS", "REB", "AST"]])
-            except Exception:
-                pass
-
-        opp_rows = data.get("opp_results_rows")
-        if opp_rows:
-            opp_name = data.get("opp_name", "Opponent Team")
-            st.subheader(f"📉 {opp_name} – Recent Results (Last Team Games)")
-            df_opp = pd.DataFrame(opp_rows)
-            st.dataframe(df_opp, width="stretch")
-
-        with st.expander("View Raw Logs & Injuries", expanded=False):
-            st.markdown(f"**Player:** {p_label}")
-            st.markdown(f"**Matchup:** {m_label}")
-            st.markdown(f"**Date:** {d_label}")
-
-            c1, c2 = st.columns(2)
-            c1.warning(f"Home Injuries:\n{data.get('inj_home', 'N/A')}")
-            c2.error(f"Away Injuries:\n{data.get('inj_opp', 'N/A')}")
-
-            st.markdown("**Raw Game Log (Last Team Games):**")
-            st.code(data.get("log", "No logs"))
-
-        st.write("### 🧠 Betting Advice")
-        st.write(data.get("analysis", "No analysis"))
-
-        st.divider()
-        for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        if val := st.chat_input("Ask follow-up..."):
-            st.session_state.messages.append({"role": "user", "content": val})
-            with st.chat_message("user"):
-                st.markdown(val)
-            with st.chat_message("assistant"):
-                with st.spinner("..."):
-                    ctx = data.get("context", "")
-                    res = llm.invoke(f"CTX:\n{ctx}\nQ: {val}").content
-                    st.markdown(res)
-            st.session_state.messages.append({"role": "assistant", "content": res})
-
+        st.header(f"{data['player']['first_name']} {data['player']['last_name']}")
+        st.caption(f"Matchup: {data.get('matchup', 'Unknown')}")
+        st.info(f"Odds: {data['odds']['odds_text']}")
+        
+        st.dataframe(pd.DataFrame(data["rows"]), use_container_width=True)
+        st.write("### Analysis")
+        st.write(data["analysis"])
 else:
-    st.warning("⚠️ Keys missing! Check your secrets.toml or enter them in the sidebar.")
+    st.warning("Enter API Keys")
