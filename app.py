@@ -298,12 +298,17 @@ def get_team_schedule_before_today(team_id, n_games: int = 7):
 
 def get_next_game_bdl(team_id, days_ahead: int = 14):
     """
-    Find the next NON-FINAL game for a team.
-    STRICT MODE: Only looks at the current season (2025-26).
+    Find the next NON-FINAL game for a team using BallDontLie schedule.
+    
+    FIX: Shifts 'today' back by 1 day to account for UTC rollover.
+    This ensures late-night US games (which are 'tomorrow' in UTC) aren't skipped.
     """
     try:
-        current_season = get_current_season()
-        today = datetime.now().strftime("%Y-%m-%d")
+        season = get_current_season()
+        
+        # FIX: Look back 1 day to handle UTC timezone difference
+        # (e.g. 8PM EST is 1AM UTC next day. If we search 'today' UTC, we miss the 8PM game.)
+        today_safe = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         future = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
         resp = requests.get(
@@ -311,8 +316,8 @@ def get_next_game_bdl(team_id, days_ahead: int = 14):
             headers=get_bdl_headers(),
             params={
                 "team_ids[]": str(team_id),
-                "seasons[]": str(current_season), # Strict 2025-26
-                "start_date": today,
+                "seasons[]": str(season),
+                "start_date": today_safe, # <--- UPDATED
                 "end_date": future,
                 "per_page": 50,
             },
@@ -330,8 +335,9 @@ def get_next_game_bdl(team_id, days_ahead: int = 14):
         data.sort(key=lambda x: x["date"])
 
         for g in data:
+            status = g.get("status", "")
             # Skip games that are already Final
-            if g.get("status") == "Final":
+            if status == "Final":
                 continue
 
             home = g.get("home_team", {})
