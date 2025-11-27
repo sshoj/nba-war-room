@@ -369,48 +369,41 @@ def get_next_game_bdl(team_id, days_ahead: int = 14):
         
 def get_player_stats_for_games(player_id, game_ids):
     """
-    Sniper approach:
-      - For each game_id, query the API *directly* for that player+game.
-      - Removes seasons parameter to avoid bugs.
+    BATCH FETCH: Fixes the Rate Limit / 'DNP' issue.
+    Fetches all stats in ONE call instead of looping.
     """
     stats_by_game = {}
     if not game_ids:
         return stats_by_game
 
-    pid_str = str(player_id)
-
-    for gid in game_ids:
-        gid_str = str(gid)
-        try:
-            resp = requests.get(
-                f"{BDL_URL}/stats",
-                headers=get_bdl_headers(),
-                params={
-                    "player_ids[]": pid_str,     # filter by THIS player
-                    "game_ids[]": gid_str,       # and THIS game
-                    "per_page": 100,             
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code != 200:
-                continue
-
+    try:
+        # Convert all IDs to strings for the API
+        str_gids = [str(g) for g in game_ids]
+        
+        # ONE API CALL for all games
+        resp = requests.get(
+            f"{BDL_URL}/stats",
+            headers=get_bdl_headers(),
+            params={
+                "game_ids[]": str_gids,
+                "player_ids[]": [str(player_id)], # Filter specifically for this player
+                "per_page": 100
+            },
+            timeout=REQUEST_TIMEOUT
+        )
+        
+        if resp.status_code == 200:
             data = resp.json().get("data", [])
-            if not isinstance(data, list) or not data:
-                continue
-
-            # Find the stat row that actually matches our player ID (Double verification)
             for s in data:
-                # BallDontLie returns player ID as integer, we compare as string to be safe
-                if str(s.get("player", {}).get("id")) == pid_str:
-                    stats_by_game[gid] = s
-                    break
-
-        except Exception:
-            continue
-
+                gid = s.get("game", {}).get("id")
+                # Ensure strict string matching to avoid ID type bugs
+                if str(s.get("player", {}).get("id")) == str(player_id):
+                    if gid:
+                        stats_by_game[gid] = s
+    except Exception:
+        pass
+        
     return stats_by_game
-
 
 
 def compute_team_form(past_games, team_id):
@@ -457,190 +450,79 @@ def compute_team_form(past_games, team_id):
 
 def compute_team_advanced_stats(team_id, games):
     """
-    Compute advanced team metrics over a window of games.
+    SAFE MATH & BATCH FIX: 
+    1. Handles None values (nulls) from the API.
+    2. Fetches team stats in one batch request.
     """
-    empty = {
-        "games_used": 0, "off_rtg": 0.0, "def_rtg": 0.0, "net_rtg": 0.0, "pace": 0.0,
-        "fg_pct": 0.0, "two_pct": 0.0, "three_pct": 0.0, "three_pa_rate": 0.0,
-        "ft_pct": 0.0, "ftr": 0.0, "orb_pct": 0.0, "drb_pct": 0.0, "reb_pg": 0.0,
-        "tov_pg": 0.0, "tov_pct": 0.0,
-    }
-
-    if not games:
-        return empty
-
-    game_ids = [g.get("id") for g in games if g.get("id") is not None]
-    if not game_ids:
-        return empty
-
-    # --- fetch ALL stats rows for these games (paginate) ---
+    if not games: return {}
+    
+    # Extract Game IDs
+    gids = [str(g["id"]) for g in games if g.get("id")]
+    
     all_stats = []
     try:
-        page = 1
-        while True:
-            params = {
-                "game_ids[]": [str(gid) for gid in game_ids],
-                "per_page": 100,
-                "page": page,
-            }
-            resp = requests.get(
-                f"{BDL_URL}/stats",
-                headers=get_bdl_headers(),
-                params=params,
-                timeout=REQUEST_TIMEOUT,
-            )
-            if resp.status_code != 200:
-                break
-            batch = resp.json().get("data", [])
-            if not batch:
-                break
-            all_stats.extend(batch)
-            if len(batch) < 100:
-                break
-            page += 1
-    except Exception:
-        all_stats = []
+        # Batch fetch all stats for these games
+        resp = requests.get(
+            f"{BDL_URL}/stats", 
+            headers=get_bdl_headers(), 
+            params={"game_ids[]": gids, "per_page": 100}, 
+            timeout=REQUEST_TIMEOUT
+        )
+        if resp.status_code == 200:
+            all_stats = resp.json().get("data", [])
+    except Exception: 
+        pass
 
-    if not all_stats:
-        return empty
+    if not all_stats: return {}
 
-    # --- aggregate per game: team vs opponent ---
-    per_game = {}
+    totals = {"team_pts": 0, "team_poss": 0, "opp_pts": 0}
+    
+    # Map stats to games to separate Team vs Opponent
+    game_map = {}
     for s in all_stats:
-        game = s.get("game") or {}
-        gid = game.get("id")
-        if gid not in game_ids:
-            continue
+        gid = s.get("game", {}).get("id")
+        tid = s.get("team", {}).get("id")
+        
+        if not gid or not tid: continue
 
-        t = s.get("team") or {}
-        side = "team" if t.get("id") == team_id else "opp"
-
-        if gid not in per_game:
-            per_game[gid] = {
-                "team": {
-                    "pts": 0, "fgm": 0, "fga": 0, "fg3m": 0, "fg3a": 0,
-                    "ftm": 0, "fta": 0, "oreb": 0, "dreb": 0, "reb": 0, "tov": 0,
-                },
-                "opp": {
-                    "pts": 0, "fgm": 0, "fga": 0, "fg3m": 0, "fg3a": 0,
-                    "ftm": 0, "fta": 0, "oreb": 0, "dreb": 0, "reb": 0, "tov": 0,
-                },
+        if gid not in game_map: 
+            game_map[gid] = {
+                team_id: {"fga":0, "oreb":0, "tov":0, "fta":0, "pts":0}, 
+                "opp": {"fga":0, "oreb":0, "tov":0, "fta":0, "pts":0}
             }
-
-        # FIX: Use (value or 0) to handle NoneTypes safely
-        bucket = per_game[gid][side]
-        bucket["pts"] += (s.get("pts") or 0)
-        bucket["fgm"] += (s.get("fgm") or 0)
-        bucket["fga"] += (s.get("fga") or 0)
-        bucket["fg3m"] += (s.get("fg3m") or 0)
-        bucket["fg3a"] += (s.get("fg3a") or 0)
-        bucket["ftm"] += (s.get("ftm") or 0)
-        bucket["fta"] += (s.get("fta") or 0)
+        
+        # Determine which bucket this stat belongs to
+        bucket_key = team_id if tid == team_id else "opp"
+        bucket = game_map[gid][bucket_key]
+        
+        # --- SAFE ADDITION (The Fix) ---
+        # We use (val or 0) so if API sends None, we add 0
+        bucket["fga"]  += (s.get("fga") or 0)
         bucket["oreb"] += (s.get("oreb") or 0)
-        bucket["dreb"] += (s.get("dreb") or 0)
-        bucket["reb"] += (s.get("reb") or 0)
-        bucket["tov"] += (s.get("turnover") or 0)
+        bucket["tov"]  += (s.get("turnover") or 0)
+        bucket["fta"]  += (s.get("fta") or 0)
+        bucket["pts"]  += (s.get("pts") or 0)
 
-    # --- accumulate over games ---
-    games_used = 0
-    tot_team_pts = tot_opp_pts = 0.0
-    tot_team_poss = tot_opp_poss = 0.0
+    # Calculate Possessions
+    for gid, data in game_map.items():
+        t = data[team_id]
+        o = data["opp"]
+        
+        # Basic Possession Formula
+        t_poss = 0.96 * (t["fga"] + t["tov"] + 0.44 * t["fta"] - t["oreb"])
+        
+        totals["team_pts"] += t["pts"]
+        totals["opp_pts"] += o["pts"]
+        totals["team_poss"] += t_poss
 
-    tot_fgm = tot_fga = 0.0
-    tot_fg3m = tot_fg3a = 0.0
-    tot_ftm = tot_fta = 0.0
-    tot_oreb = tot_dreb = tot_reb = 0.0
-    tot_opp_oreb = tot_opp_dreb = 0.0
-    tot_tov = 0.0
-
-    for gid in game_ids:
-        rec = per_game.get(gid)
-        if not rec:
-            continue
-        team = rec["team"]
-        opp = rec["opp"]
-
-        team_poss = (
-            team["fga"]
-            - team["oreb"]
-            + team["tov"]
-            + 0.44 * team["fta"]
-        )
-        opp_poss = (
-            opp["fga"]
-            - opp["oreb"]
-            + opp["tov"]
-            + 0.44 * opp["fta"]
-        )
-
-        tot_team_pts += team["pts"]
-        tot_opp_pts += opp["pts"]
-        tot_team_poss += team_poss
-        tot_opp_poss += opp_poss
-
-        tot_fgm += team["fgm"]
-        tot_fga += team["fga"]
-        tot_fg3m += team["fg3m"]
-        tot_fg3a += team["fg3a"]
-        tot_ftm += team["ftm"]
-        tot_fta += team["fta"]
-        tot_oreb += team["oreb"]
-        tot_dreb += team["dreb"]
-        tot_reb += team["reb"]
-        tot_opp_oreb += opp["oreb"]
-        tot_opp_dreb += opp["dreb"]
-        tot_tov += team["tov"]
-
-        games_used += 1
-
-    if games_used == 0 or tot_team_poss <= 0:
-        return empty
-
-    off_rtg = 100.0 * tot_team_pts / tot_team_poss
-    def_rtg = 100.0 * tot_opp_pts / tot_team_poss
-    net_rtg = off_rtg - def_rtg
-
-    pace = (tot_team_poss + tot_opp_poss) / (2.0 * games_used)
-
-    fg_pct = tot_fgm / tot_fga if tot_fga > 0 else 0.0
-    two_fgm = tot_fgm - tot_fg3m
-    two_fga = tot_fga - tot_fg3a
-    two_pct = two_fgm / two_fga if two_fga > 0 else 0.0
-    three_pct = tot_fg3m / tot_fg3a if tot_fg3a > 0 else 0.0
-    three_pa_rate = tot_fg3a / tot_fga if tot_fga > 0 else 0.0
-
-    ft_pct = tot_ftm / tot_fta if tot_fta > 0 else 0.0
-    ftr = tot_fta / tot_fga if tot_fga > 0 else 0.0
-
-    orb_den = tot_oreb + tot_opp_dreb
-    drb_den = tot_dreb + tot_opp_oreb
-    orb_pct = tot_oreb / orb_den if orb_den > 0 else 0.0
-    drb_pct = tot_dreb / drb_den if drb_den > 0 else 0.0
-    reb_pg = tot_reb / games_used
-
-    tov_pg = tot_tov / games_used
-    tov_pct = tot_tov / tot_team_poss if tot_team_poss > 0 else 0.0
-
+    if totals["team_poss"] == 0: return {}
+    
     return {
-        "games_used": games_used,
-        "off_rtg": off_rtg,
-        "def_rtg": def_rtg,
-        "net_rtg": net_rtg,
-        "pace": pace,
-        "fg_pct": fg_pct,
-        "two_pct": two_pct,
-        "three_pct": three_pct,
-        "three_pa_rate": three_pa_rate,
-        "ft_pct": ft_pct,
-        "ftr": ftr,
-        "orb_pct": orb_pct,
-        "drb_pct": drb_pct,
-        "reb_pg": reb_pg,
-        "tov_pg": tov_pg,
-        "tov_pct": tov_pct,
+        "off_rtg": 100 * totals["team_pts"] / totals["team_poss"],
+        "def_rtg": 100 * totals["opp_pts"] / totals["team_poss"],
+        "net_rtg": 100 * (totals["team_pts"] - totals["opp_pts"]) / totals["team_poss"],
+        "games_used": len(games)
     }
-
-
 def get_team_players(team_id):
     """Fetch current roster (players + positions) for a team."""
     try:
