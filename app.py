@@ -298,10 +298,11 @@ def get_team_schedule_before_today(team_id, n_games: int = 7):
 
 def get_next_game_bdl(team_id, days_ahead: int = 14):
     """
-    Find the next NON-FINAL game for a team using BallDontLie schedule.
+    Find the next NON-FINAL game for a team.
+    STRICT MODE: Only looks at the current season (2025-26).
     """
     try:
-        season = get_current_season()
+        current_season = get_current_season()
         today = datetime.now().strftime("%Y-%m-%d")
         future = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
@@ -310,13 +311,14 @@ def get_next_game_bdl(team_id, days_ahead: int = 14):
             headers=get_bdl_headers(),
             params={
                 "team_ids[]": str(team_id),
-                "seasons[]": str(season),
+                "seasons[]": str(current_season), # Strict 2025-26
                 "start_date": today,
                 "end_date": future,
                 "per_page": 50,
             },
             timeout=REQUEST_TIMEOUT,
         )
+        
         if resp.status_code != 200:
             return None, None, None, None, None, None
 
@@ -324,13 +326,12 @@ def get_next_game_bdl(team_id, days_ahead: int = 14):
         if not data:
             return None, None, None, None, None, None
 
-        # Sort upcoming games by date (soonest first)
+        # Sort by date ascending (soonest game first)
         data.sort(key=lambda x: x["date"])
 
         for g in data:
-            status = g.get("status", "")
-            # Skip games that are already final; allow Scheduled / In Progress / etc.
-            if status == "Final":
+            # Skip games that are already Final
+            if g.get("status") == "Final":
                 continue
 
             home = g.get("home_team", {})
@@ -345,6 +346,7 @@ def get_next_game_bdl(team_id, days_ahead: int = 14):
 
             matchup_str = f"{loc} {opp.get('full_name', 'Unknown')}"
             date_str = g.get("date", "").split("T")[0]
+            
             return (
                 matchup_str,
                 date_str,
