@@ -451,7 +451,7 @@ def compute_team_form(past_games, team_id):
 def compute_team_advanced_stats(team_id, games):
     """
     Computes advanced stats using Safe Math.
-    FIX: Now actually aggregates and calculates FG%, Pace, Rebounds, etc.
+    FIX: Ensures dictionary keys match the UI exactly (e.g. 'three_pct' vs '3p_pct')
     """
     if not games: return {}
     
@@ -481,7 +481,6 @@ def compute_team_advanced_stats(team_id, games):
     }
 
     # 3. Aggregate per game
-    # We group by game first to calculate possessions per game correctly
     games_data = {} 
     
     for s in all_stats:
@@ -490,10 +489,9 @@ def compute_team_advanced_stats(team_id, games):
         
         if gid not in games_data: games_data[gid] = {"team": {}, "opp": {}}
         
-        # Determine bucket
         side = "team" if tid == team_id else "opp"
         
-        # Store stats for this side
+        # Safe Math aggregation
         games_data[gid][side] = {
             "pts": (s.get("pts") or 0),
             "fga": (s.get("fga") or 0),
@@ -515,16 +513,13 @@ def compute_team_advanced_stats(team_id, games):
         t = sides.get("team")
         o = sides.get("opp")
         
-        # Skip if we don't have data for both sides (rare but possible)
         if not t or not o: continue
         games_count += 1
 
-        # Calculate Possessions for this game (Basic Formula)
-        # Poss = 0.96 * (FGA + TOV + 0.44 * FTA - OREB)
+        # Possessions Formula
         g_t_poss = 0.96 * (t["fga"] + t["tov"] + 0.44 * t["fta"] - t["oreb"])
         g_o_poss = 0.96 * (o["fga"] + o["tov"] + 0.44 * o["fta"] - o["oreb"])
         
-        # Add to Totals
         t_stats["poss"] += g_t_poss
         o_stats["poss"] += g_o_poss
         
@@ -535,28 +530,26 @@ def compute_team_advanced_stats(team_id, games):
 
     if games_count == 0 or t_stats["poss"] == 0: return {}
 
-    # 5. Calculate Final Metrics
-    # Pace = (Team Poss + Opp Poss) / 2 / Games
+    # 5. Calculate Final Metrics (Using keys that match your UI)
     avg_pace = (t_stats["poss"] + o_stats["poss"]) / 2 / games_count
     
     return {
         "games_used": games_count,
-        # Ratings
         "off_rtg": 100 * t_stats["pts"] / t_stats["poss"],
-        "def_rtg": 100 * o_stats["pts"] / t_stats["poss"], # Use team poss for consistency
+        "def_rtg": 100 * o_stats["pts"] / t_stats["poss"],
         "net_rtg": 100 * (t_stats["pts"] - o_stats["pts"]) / t_stats["poss"],
         "pace": avg_pace,
         
-        # Shooting %
+        # Shooting Keys (Renamed to match UI)
         "fg_pct": t_stats["fgm"] / t_stats["fga"] if t_stats["fga"] else 0,
-        "3p_pct": t_stats["fg3m"] / t_stats["fg3a"] if t_stats["fg3a"] else 0,
+        "three_pct": t_stats["fg3m"] / t_stats["fg3a"] if t_stats["fg3a"] else 0, # UI expects 'three_pct'
         "ft_pct": t_stats["ftm"] / t_stats["fta"] if t_stats["fta"] else 0,
         
-        # Rates
-        "3pa_rate": t_stats["fg3a"] / t_stats["fga"] if t_stats["fga"] else 0,
+        # Rates (Renamed to match UI)
+        "three_pa_rate": t_stats["fg3a"] / t_stats["fga"] if t_stats["fga"] else 0, # UI expects 'three_pa_rate'
         "ftr": t_stats["fta"] / t_stats["fga"] if t_stats["fga"] else 0,
         
-        # Rebounding (Needs Opponent Data)
+        # Rebounding
         "orb_pct": t_stats["oreb"] / (t_stats["oreb"] + o_stats["dreb"]) if (t_stats["oreb"] + o_stats["dreb"]) else 0,
         "drb_pct": t_stats["dreb"] / (t_stats["dreb"] + o_stats["oreb"]) if (t_stats["dreb"] + o_stats["oreb"]) else 0,
         "reb_pg": t_stats["reb"] / games_count,
