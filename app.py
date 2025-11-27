@@ -450,18 +450,15 @@ def compute_team_form(past_games, team_id):
 
 def compute_team_advanced_stats(team_id, games):
     """
-    SAFE MATH & BATCH FIX: 
-    1. Handles None values (nulls) from the API.
-    2. Fetches team stats in one batch request.
+    Computes advanced stats using Safe Math.
+    FIX: Now actually aggregates and calculates FG%, Pace, Rebounds, etc.
     """
     if not games: return {}
     
-    # Extract Game IDs
-    gids = [str(g["id"]) for g in games if g.get("id")]
-    
+    # 1. Fetch Stats
+    gids = [str(g["id"]) for g in games]
     all_stats = []
     try:
-        # Batch fetch all stats for these games
         resp = requests.get(
             f"{BDL_URL}/stats", 
             headers=get_bdl_headers(), 
@@ -470,59 +467,105 @@ def compute_team_advanced_stats(team_id, games):
         )
         if resp.status_code == 200:
             all_stats = resp.json().get("data", [])
-    except Exception: 
-        pass
+    except: pass
 
     if not all_stats: return {}
 
-    totals = {"team_pts": 0, "team_poss": 0, "opp_pts": 0}
+    # 2. Accumulators
+    t_stats = {
+        "pts": 0, "fga": 0, "fgm": 0, "fg3a": 0, "fg3m": 0, "fta": 0, "ftm": 0,
+        "oreb": 0, "dreb": 0, "reb": 0, "ast": 0, "tov": 0, "poss": 0
+    }
+    o_stats = {
+        "pts": 0, "fga": 0, "fgm": 0, "fta": 0, "oreb": 0, "dreb": 0, "tov": 0, "poss": 0
+    }
+
+    # 3. Aggregate per game
+    # We group by game first to calculate possessions per game correctly
+    games_data = {} 
     
-    # Map stats to games to separate Team vs Opponent
-    game_map = {}
     for s in all_stats:
-        gid = s.get("game", {}).get("id")
-        tid = s.get("team", {}).get("id")
+        gid = s["game"]["id"]
+        tid = s["team"]["id"]
         
-        if not gid or not tid: continue
+        if gid not in games_data: games_data[gid] = {"team": {}, "opp": {}}
+        
+        # Determine bucket
+        side = "team" if tid == team_id else "opp"
+        
+        # Store stats for this side
+        games_data[gid][side] = {
+            "pts": (s.get("pts") or 0),
+            "fga": (s.get("fga") or 0),
+            "fgm": (s.get("fgm") or 0),
+            "fg3a": (s.get("fg3a") or 0),
+            "fg3m": (s.get("fg3m") or 0),
+            "fta": (s.get("fta") or 0),
+            "ftm": (s.get("ftm") or 0),
+            "oreb": (s.get("oreb") or 0),
+            "dreb": (s.get("dreb") or 0),
+            "reb": (s.get("reb") or 0),
+            "ast": (s.get("ast") or 0),
+            "tov": (s.get("turnover") or 0)
+        }
 
-        if gid not in game_map: 
-            game_map[gid] = {
-                team_id: {"fga":0, "oreb":0, "tov":0, "fta":0, "pts":0}, 
-                "opp": {"fga":0, "oreb":0, "tov":0, "fta":0, "pts":0}
-            }
+    # 4. Process Game Totals
+    games_count = 0
+    for gid, sides in games_data.items():
+        t = sides.get("team")
+        o = sides.get("opp")
         
-        # Determine which bucket this stat belongs to
-        bucket_key = team_id if tid == team_id else "opp"
-        bucket = game_map[gid][bucket_key]
-        
-        # --- SAFE ADDITION (The Fix) ---
-        # We use (val or 0) so if API sends None, we add 0
-        bucket["fga"]  += (s.get("fga") or 0)
-        bucket["oreb"] += (s.get("oreb") or 0)
-        bucket["tov"]  += (s.get("turnover") or 0)
-        bucket["fta"]  += (s.get("fta") or 0)
-        bucket["pts"]  += (s.get("pts") or 0)
+        # Skip if we don't have data for both sides (rare but possible)
+        if not t or not o: continue
+        games_count += 1
 
-    # Calculate Possessions
-    for gid, data in game_map.items():
-        t = data[team_id]
-        o = data["opp"]
+        # Calculate Possessions for this game (Basic Formula)
+        # Poss = 0.96 * (FGA + TOV + 0.44 * FTA - OREB)
+        g_t_poss = 0.96 * (t["fga"] + t["tov"] + 0.44 * t["fta"] - t["oreb"])
+        g_o_poss = 0.96 * (o["fga"] + o["tov"] + 0.44 * o["fta"] - o["oreb"])
         
-        # Basic Possession Formula
-        t_poss = 0.96 * (t["fga"] + t["tov"] + 0.44 * t["fta"] - t["oreb"])
+        # Add to Totals
+        t_stats["poss"] += g_t_poss
+        o_stats["poss"] += g_o_poss
         
-        totals["team_pts"] += t["pts"]
-        totals["opp_pts"] += o["pts"]
-        totals["team_poss"] += t_poss
+        for k in t_stats:
+            if k != "poss": t_stats[k] += t.get(k, 0)
+        for k in o_stats:
+            if k != "poss": o_stats[k] += o.get(k, 0)
 
-    if totals["team_poss"] == 0: return {}
+    if games_count == 0 or t_stats["poss"] == 0: return {}
+
+    # 5. Calculate Final Metrics
+    # Pace = (Team Poss + Opp Poss) / 2 / Games
+    avg_pace = (t_stats["poss"] + o_stats["poss"]) / 2 / games_count
     
     return {
-        "off_rtg": 100 * totals["team_pts"] / totals["team_poss"],
-        "def_rtg": 100 * totals["opp_pts"] / totals["team_poss"],
-        "net_rtg": 100 * (totals["team_pts"] - totals["opp_pts"]) / totals["team_poss"],
-        "games_used": len(games)
+        "games_used": games_count,
+        # Ratings
+        "off_rtg": 100 * t_stats["pts"] / t_stats["poss"],
+        "def_rtg": 100 * o_stats["pts"] / t_stats["poss"], # Use team poss for consistency
+        "net_rtg": 100 * (t_stats["pts"] - o_stats["pts"]) / t_stats["poss"],
+        "pace": avg_pace,
+        
+        # Shooting %
+        "fg_pct": t_stats["fgm"] / t_stats["fga"] if t_stats["fga"] else 0,
+        "3p_pct": t_stats["fg3m"] / t_stats["fg3a"] if t_stats["fg3a"] else 0,
+        "ft_pct": t_stats["ftm"] / t_stats["fta"] if t_stats["fta"] else 0,
+        
+        # Rates
+        "3pa_rate": t_stats["fg3a"] / t_stats["fga"] if t_stats["fga"] else 0,
+        "ftr": t_stats["fta"] / t_stats["fga"] if t_stats["fga"] else 0,
+        
+        # Rebounding (Needs Opponent Data)
+        "orb_pct": t_stats["oreb"] / (t_stats["oreb"] + o_stats["dreb"]) if (t_stats["oreb"] + o_stats["dreb"]) else 0,
+        "drb_pct": t_stats["dreb"] / (t_stats["dreb"] + o_stats["oreb"]) if (t_stats["dreb"] + o_stats["oreb"]) else 0,
+        "reb_pg": t_stats["reb"] / games_count,
+        
+        # Turnovers
+        "tov_pg": t_stats["tov"] / games_count,
+        "tov_pct": 100 * t_stats["tov"] / t_stats["poss"]
     }
+    
 def get_team_players(team_id):
     """Fetch current roster (players + positions) for a team."""
     try:
