@@ -451,11 +451,10 @@ def compute_team_form(past_games, team_id):
 def compute_team_advanced_stats(team_id, games):
     """
     Computes advanced stats using Safe Math.
-    FIX: Ensures dictionary keys match the UI exactly (e.g. 'three_pct' vs '3p_pct')
+    FIX: Calculates per-game averages so charts don't show 0.0.
     """
     if not games: return {}
     
-    # 1. Fetch Stats
     gids = [str(g["id"]) for g in games]
     all_stats = []
     try:
@@ -471,58 +470,37 @@ def compute_team_advanced_stats(team_id, games):
 
     if not all_stats: return {}
 
-    # 2. Accumulators
-    t_stats = {
-        "pts": 0, "fga": 0, "fgm": 0, "fg3a": 0, "fg3m": 0, "fta": 0, "ftm": 0,
-        "oreb": 0, "dreb": 0, "reb": 0, "ast": 0, "tov": 0, "poss": 0
-    }
-    o_stats = {
-        "pts": 0, "fga": 0, "fgm": 0, "fta": 0, "oreb": 0, "dreb": 0, "tov": 0, "poss": 0
-    }
+    # Accumulators
+    t_stats = {"pts": 0, "fga": 0, "fgm": 0, "fg3a": 0, "fg3m": 0, "fta": 0, "ftm": 0, "oreb": 0, "dreb": 0, "reb": 0, "ast": 0, "tov": 0, "poss": 0}
+    o_stats = {"pts": 0, "fga": 0, "fgm": 0, "fta": 0, "oreb": 0, "dreb": 0, "tov": 0, "poss": 0}
 
-    # 3. Aggregate per game
+    # Aggregate per game
     games_data = {} 
-    
     for s in all_stats:
         gid = s["game"]["id"]
         tid = s["team"]["id"]
-        
         if gid not in games_data: games_data[gid] = {"team": {}, "opp": {}}
         
         side = "team" if tid == team_id else "opp"
-        
-        # Safe Math aggregation
         games_data[gid][side] = {
-            "pts": (s.get("pts") or 0),
-            "fga": (s.get("fga") or 0),
-            "fgm": (s.get("fgm") or 0),
-            "fg3a": (s.get("fg3a") or 0),
-            "fg3m": (s.get("fg3m") or 0),
-            "fta": (s.get("fta") or 0),
-            "ftm": (s.get("ftm") or 0),
-            "oreb": (s.get("oreb") or 0),
-            "dreb": (s.get("dreb") or 0),
-            "reb": (s.get("reb") or 0),
-            "ast": (s.get("ast") or 0),
-            "tov": (s.get("turnover") or 0)
+            "pts": (s.get("pts") or 0), "fga": (s.get("fga") or 0), "fgm": (s.get("fgm") or 0),
+            "fg3a": (s.get("fg3a") or 0), "fg3m": (s.get("fg3m") or 0), "fta": (s.get("fta") or 0),
+            "ftm": (s.get("ftm") or 0), "oreb": (s.get("oreb") or 0), "dreb": (s.get("dreb") or 0),
+            "reb": (s.get("reb") or 0), "ast": (s.get("ast") or 0), "tov": (s.get("turnover") or 0)
         }
 
-    # 4. Process Game Totals
     games_count = 0
     for gid, sides in games_data.items():
         t = sides.get("team")
         o = sides.get("opp")
-        
         if not t or not o: continue
         games_count += 1
 
-        # Possessions Formula
         g_t_poss = 0.96 * (t["fga"] + t["tov"] + 0.44 * t["fta"] - t["oreb"])
         g_o_poss = 0.96 * (o["fga"] + o["tov"] + 0.44 * o["fta"] - o["oreb"])
         
         t_stats["poss"] += g_t_poss
         o_stats["poss"] += g_o_poss
-        
         for k in t_stats:
             if k != "poss": t_stats[k] += t.get(k, 0)
         for k in o_stats:
@@ -530,31 +508,20 @@ def compute_team_advanced_stats(team_id, games):
 
     if games_count == 0 or t_stats["poss"] == 0: return {}
 
-    # 5. Calculate Final Metrics (Using keys that match your UI)
-    avg_pace = (t_stats["poss"] + o_stats["poss"]) / 2 / games_count
-    
     return {
         "games_used": games_count,
         "off_rtg": 100 * t_stats["pts"] / t_stats["poss"],
         "def_rtg": 100 * o_stats["pts"] / t_stats["poss"],
         "net_rtg": 100 * (t_stats["pts"] - o_stats["pts"]) / t_stats["poss"],
-        "pace": avg_pace,
-        
-        # Shooting Keys (Renamed to match UI)
+        "pace": (t_stats["poss"] + o_stats["poss"]) / 2 / games_count,
         "fg_pct": t_stats["fgm"] / t_stats["fga"] if t_stats["fga"] else 0,
-        "three_pct": t_stats["fg3m"] / t_stats["fg3a"] if t_stats["fg3a"] else 0, # UI expects 'three_pct'
+        "three_pct": t_stats["fg3m"] / t_stats["fg3a"] if t_stats["fg3a"] else 0,
         "ft_pct": t_stats["ftm"] / t_stats["fta"] if t_stats["fta"] else 0,
-        
-        # Rates (Renamed to match UI)
-        "three_pa_rate": t_stats["fg3a"] / t_stats["fga"] if t_stats["fga"] else 0, # UI expects 'three_pa_rate'
+        "three_pa_rate": t_stats["fg3a"] / t_stats["fga"] if t_stats["fga"] else 0,
         "ftr": t_stats["fta"] / t_stats["fga"] if t_stats["fga"] else 0,
-        
-        # Rebounding
         "orb_pct": t_stats["oreb"] / (t_stats["oreb"] + o_stats["dreb"]) if (t_stats["oreb"] + o_stats["dreb"]) else 0,
         "drb_pct": t_stats["dreb"] / (t_stats["dreb"] + o_stats["oreb"]) if (t_stats["dreb"] + o_stats["oreb"]) else 0,
         "reb_pg": t_stats["reb"] / games_count,
-        
-        # Turnovers
         "tov_pg": t_stats["tov"] / games_count,
         "tov_pct": 100 * t_stats["tov"] / t_stats["poss"]
     }
